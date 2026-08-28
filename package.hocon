@@ -1,0 +1,50 @@
+// OpenSSL — a TLS client for sysl, bound over memory BIOs.
+//
+// This is the block a consumer writes to reach this package:
+//
+//     dependencies {
+//       openssl { git = "github.com/sysl-lang/openssl", version = "0.1.0" }
+//     }
+//
+// The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
+// tag `v0.1.0` on this repository.
+//
+// **OpenSSL has to be installed, and so do its headers.** Nothing is vendored: OpenSSL is a very
+// large C project with its own build system, and a package carrying it would be carrying a port.
+//
+//     brew install openssl@3          # macOS
+//     sudo apt install libssl-dev     # Debian / Ubuntu
+//     sudo pacman -S openssl          # Arch
+//
+// **The build needs no flags**, because OpenSSL installs `libssl.pc` and `libcrypto.pc` beside
+// itself and the `pkg_config` requirements below ask the machine where they are.
+
+package {
+  name    = "openssl"
+  version = "0.1.0"
+
+  // The compiler this was written against and the only one it is known to build with. Lower it when
+  // somebody builds this with an older one — a floor is meant to be a fact rather than a guess.
+  sysl = "0.0.87"
+}
+
+// **`posix`, because TLS is only half of what this is for and the other half is a socket.** The
+// binding itself touches no socket at all — that is the whole point of the memory-BIO shape — but
+// the machine's certificate store is a directory of files, and there is no freestanding target
+// where `SSL_CTX_set_default_verify_paths` means anything.
+//
+// **`heap`, because every handle is one OpenSSL allocated.** A context, a connection and its two
+// buffers are pointers this package frees exactly once; nothing here asks a caller for storage.
+requires {
+  heap  = true
+  posix = true
+
+  // **Both, and the second one is not redundant.** `libssl.pc` names libcrypto only as a private
+  // requirement, which covers a static link and not a direct reference — and the error surface here
+  // (`ERR_get_error`, `ERR_error_string_n`) lives in libcrypto, so a link line with only `-lssl`
+  // fails on any platform with a two-level namespace.
+  pkg_config {
+    libssl    = "OpenSSL — `brew install openssl@3` on macOS, Debian's libssl-dev, Arch's openssl"
+    libcrypto = "OpenSSL — installed by the same package as libssl"
+  }
+}

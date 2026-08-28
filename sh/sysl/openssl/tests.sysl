@@ -1,0 +1,147 @@
+// What this package claims, run without a network.
+//
+// **A memory-BIO binding is testable with no socket at all, and that is the design paying for
+// itself.** Everything below drives the real OpenSSL through the real buffers; what is missing is
+// only the peer, so what is checked is that bytes come out when they should, go in when they are
+// given, and that a failure is reported as one. The live handshake against a real server is in the
+// README, because a unit suite that needs the internet fails on a train.
+
+module sh.sysl.openssl
+@tests
+
+import sysl.harness.*
+
+@test
+a_client_reads_the_machines_certificate_store()
+    // **The one failure that must never be quiet.** A client that could not load a trust store would
+    // verify nothing and still look like TLS, so `client()` reports rather than degrades.
+    assert(client().is_ok(), "this machine's OpenSSL could not find its certificate store")
+
+@test
+a_handshake_produces_a_client_hello_before_anything_has_been_received()
+    val cl = client().unwrap()
+    val s = connect(cl, "example.com").unwrap()
+
+    // Nothing has arrived, so the handshake cannot finish -- but it has something to say.
+    assert(s.handshake().unwrap() == Step.Wants)
+
+    val waiting = s.waiting()
+
+    assert(waiting > 0, "a handshake produced no bytes to send")
+
+    var out: [4096]u8
+    val n = s.outgoing(out[0..<4096])
+
+    assert_eq(n, waiting)
+
+    // **A TLS record: handshake (0x16), then the legacy version 3.1, then a big-endian length.**
+    // Asserting the shape rather than only the length is what makes this a test of the protocol
+    // rather than of the buffer.
+    assert_eq(out[0], u8(0x16))
+    assert_eq(out[1], u8(0x03))
+    assert_eq(out[2], u8(0x01))
+    assert_eq(usize(out[3]) * 256 + usize(out[4]), n - 5)
+
+    // Drained, so a second ask has nothing.
+    assert_eq(s.outgoing(out[0..<4096]), 0)
+
+@test
+nothing_is_waiting_to_be_sent_until_something_has_been_asked_for()
+    // **The trap this package's first live handshake fell into.** A driving loop that drains before
+    // it asks sends nothing at all, then blocks reading a socket the server is also blocked reading
+    // -- which looks like a network fault and is a loop written in the wrong order. One line here
+    // pins the fact that makes it happen.
+    val cl = client().unwrap()
+    val s = connect(cl, "example.com").unwrap()
+
+    var out: [4096]u8
+
+    assert_eq(s.waiting(), 0)
+    assert_eq(s.outgoing(out[0..<4096]), 0)
+
+    s.handshake().unwrap()
+
+    assert(s.waiting() > 0, "asking for progress produced nothing to send")
+
+@test
+the_host_travels_as_sni_so_a_shared_server_knows_which_certificate_to_send()
+    // **Not a nicety: GitHub answers nothing without it.** The name is in the ClientHello in the
+    // clear, which is what makes it checkable here.
+    val cl = client().unwrap()
+    val s = connect(cl, "some-very-distinctive-name.example.com").unwrap()
+
+    s.handshake().unwrap()
+
+    var out: [4096]u8
+    val n = s.outgoing(out[0..<4096])
+
+    assert(holds(out[0..<n], "some-very-distinctive-name.example.com".bytes),
+        "the host name was not in the ClientHello, so SNI is not being sent")
+
+// Whether one run of bytes appears inside another.
+private holds(hay: []const u8, needle: []const u8) -> bool
+    if needle.len == 0 || needle.len > hay.len then return false
+
+    for i in 0..(hay.len - needle.len)
+        var same = true
+
+        for j in 0..<needle.len
+            if hay[i + j] != needle[j] then same = false
+
+        if same then return true
+
+    false
+end holds
+
+@test
+nonsense_arriving_from_the_peer_is_a_failure_and_not_a_wait()
+    val cl = client().unwrap()
+    val s = connect(cl, "example.com").unwrap()
+
+    s.handshake().unwrap()
+
+    var out: [4096]u8
+
+    s.outgoing(out[0..<4096])
+
+    // A TLS record header that is not one. **The distinction under test is `Wants` from `Err`**:
+    // waiting for more bytes and being handed rubbish look alike to a caller that does not check.
+    s.incoming("this is not a TLS record at all".bytes).unwrap()
+
+    assert(s.handshake().is_err(), "a stream fed nonsense reported that it wanted more")
+
+@test
+a_failure_carries_openssls_own_words()
+    val cl = client().unwrap()
+    val s = connect(cl, "example.com").unwrap()
+
+    s.handshake().unwrap()
+
+    var out: [4096]u8
+
+    s.outgoing(out[0..<4096])
+    s.incoming("this is not a TLS record at all".bytes).unwrap()
+
+    // **The message is the reason to have an error type at all.** A caller reporting "TLS failed"
+    // and nothing else sends its reader nowhere.
+    val e = s.handshake().unwrap_err()
+
+    assert(e.code != 0, "OpenSSL had something in its error queue and the failure did not carry it")
+    assert(e.message.len > 12, s"the failure said only `${e.message}`")
+
+@test
+an_empty_handover_is_nothing_rather_than_a_fault()
+    // The degenerate cases a driving loop hits constantly: a socket read that returned nothing, and
+    // a buffer with no room.
+    val cl = client().unwrap()
+    val s = connect(cl, "example.com").unwrap()
+
+    var none: [0]u8
+
+    assert(s.incoming(none[0..<0]).is_ok())
+    assert_eq(s.outgoing(none[0..<0]), 0)
+    // **A bare enum has `==` and one carrying a payload does not**, so this is a `match` rather
+    // than a comparison -- which is the org's rule showing up in a test.
+    s.send(none[0..<0]).unwrap() match
+        Took(n) -> assert_eq(n, 0)
+        Wants -> assert(false, "sending nothing said it wanted the buffers pumped")

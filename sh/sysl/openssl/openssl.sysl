@@ -1,0 +1,310 @@
+// TLS for sysl, as a byte-stream transformer.
+//
+// **OpenSSL is never given the socket.** It is given a pair of in-memory buffers: ciphertext the
+// program received goes in one end, plaintext comes out; plaintext the program wants to send goes
+// in, ciphertext comes out to be written. TLS is then a *transformation*, and the question of how
+// bytes reach the wire stays entirely the caller's.
+//
+// **That is Node's arrangement and it is the reason this package composes with anything.** Node's
+// `tls.TLSSocket` wraps a `net.Socket` rather than replacing it, for the same reason: an event loop
+// already owns the socket, and a TLS layer that insisted on owning one too could not be used from
+// inside it. Here it means one binding serves a blocking fetch, a libuv connection and a test with
+// no socket at all -- and the test is not a lesser case, because the whole protocol can be driven
+// between two `Stream`s in memory.
+//
+// The loop a caller writes is three steps, **and the order is not free**:
+//
+//   1. Ask for progress -- `handshake`, `send` or `receive`.
+//   2. Drain `outgoing` and write every byte of it to the socket.
+//   3. On `Wants`, read from the socket and hand what came to `incoming`. Go back to 1.
+//
+// **Draining before the first ask writes nothing, and then both ends wait forever.** Nothing is in
+// the outgoing buffer until something has been asked to produce it, so a loop that drains first
+// sends no ClientHello and then blocks reading a socket the server is also blocked reading. It
+// looks like a network fault and it is a loop written in the wrong order; the symptom is a
+// connection that ends during the handshake with nothing having crossed it. Written down because it
+// cost this package's own first live handshake.
+//
+// **`Wants` is one answer where OpenSSL has two.** It distinguishes "needs to read" from "needs to
+// write", which matters to a caller that registers interest in one direction at a time; a caller
+// that always drains `outgoing` and always feeds what arrives cannot use the difference, and every
+// caller here does both. The distinction is recoverable from `Error.reason` if it is ever wanted.
+
+module sh.sysl.openssl
+
+import sh.sysl.openssl.c
+import sysl.text.{cstring, from_cstring}
+
+// What went wrong, in OpenSSL's own words where it has any.
+//
+// **Two numbers rather than one, because they answer different questions.** `reason` is
+// `SSL_get_error`'s verdict on the call -- the protocol closed, the syscall failed, the library
+// objected -- and `code` is the top of OpenSSL's own error queue, which is what carries "certificate
+// has expired". A failure can have the first and not the second.
+struct Error
+    reason: i32
+    code: u64
+    message: string
+end Error
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message, out, fmt)
+
+private fail(reason: i32, what: string) -> Error
+    val code = c.err_get_error()
+
+    if code == 0 then return Error(reason, 0, what)
+
+    var buf: [256]u8
+
+    c.err_error_string_n(code, &buf[0], 256)
+
+    from_cstring(&buf[0]) match
+        Ok(text) -> Error(reason, code, s"${what}: ${text}")
+        Err(_) -> Error(reason, code, what)
+end fail
+
+// How far a call got.
+//
+// **`Wants` is not a failure and must not be reported as one.** It is the ordinary answer whenever
+// the protocol needs bytes moved, which during a handshake is most of the time.
+enum Step
+    Done
+    Wants
+
+// What `receive` found.
+enum Received
+    Data(n: usize)
+    Wants
+
+    // The peer closed the TLS session cleanly. **Distinct from the socket ending**, which the caller
+    // sees and this cannot: a truncated stream with no close-notify is an attack in the general case
+    // and is the caller's to notice.
+    Closed
+end Received
+
+// What `send` managed.
+enum Sent
+    Took(n: usize)
+    Wants
+end Sent
+
+// -- the context ----------------------------------------------------------------------------------
+
+// The settings every connection under it shares: which protocol versions, and which certificates to
+// trust. Made once.
+//
+// **It is a `&Client` because OpenSSL frees it and something has to say when.** `SSL_new` takes a
+// reference on the context, so a connection outliving its context would be reading freed memory --
+// which is why a `Stream` holds its client rather than only its pointer.
+struct Client
+    ctx: *c.SslCtx
+end Client
+
+impl Drop for Client
+    drop(self) = c.ctx_free(self.ctx)
+
+// A TLS client trusting the machine's certificate store.
+//
+// **The store is the operating system's rather than one shipped here.** Go does this and Node does
+// not -- Node compiles in a copy of Mozilla's list, which behaves identically everywhere and has to
+// be kept current by whoever ships it. Asking the machine means a certificate the administrator
+// added is trusted and an expiry the administrator applied is honoured, which for a package is the
+// answer with no maintenance in it.
+//
+// **TLS 1.2 is the floor.** Everything below it is broken in ways that have names.
+client() -> Result[&Client, Error]
+    c.err_clear_error()
+
+    val ctx = c.ctx_new(c.tls_client_method())
+
+    if ctx == null then return Err(fail(c.SSL_ERROR_SSL, "could not make a TLS context"))
+
+    val made = Client(ctx)
+
+    // **A refusal here is not survivable, so it is reported rather than warned about.** A client
+    // that could not load the trust store would verify nothing, and a TLS client that verifies
+    // nothing is worse than no TLS client -- it looks secure.
+    if c.ctx_set_default_verify_paths(ctx) != 1
+        return Err(fail(c.SSL_ERROR_SSL, "could not read this machine's certificate store"))
+
+    // Null is OpenSSL's own decision procedure. A callback here is how a program overrides it, and
+    // this package deliberately offers no way to.
+    c.ctx_set_verify(ctx, c.SSL_VERIFY_PEER, null)
+    c.ctx_ctrl(ctx, c.SSL_CTRL_SET_MIN_PROTO_VERSION, i64(c.TLS1_2_VERSION), null)
+
+    Ok(made)
+end client
+
+// -- one connection --------------------------------------------------------------------------------
+
+// One TLS session, and the two buffers it is driven through.
+struct Stream
+    ssl: *c.Ssl
+
+    // Ciphertext the caller received, on its way in. **Not freed here** -- see the `Drop` below.
+    rbio: *c.Bio
+
+    // Ciphertext to be written, on its way out.
+    wbio: *c.Bio
+
+    // Held so the context cannot be freed while this connection refers to it.
+    of: &Client
+
+    // Hand over ciphertext that arrived from the peer.
+    incoming(&self, bytes: []const u8) -> Result[unit, Error]
+        if bytes.len == 0 then return Ok(())
+
+        val wrote = c.bio_write(self.rbio, &bytes[0], i32(bytes.len))
+
+        if wrote < i32(bytes.len)
+            return Err(fail(c.SSL_ERROR_SSL, "the TLS input buffer would not take what arrived"))
+
+        Ok(())
+    end incoming
+
+    // Take ciphertext that has to be written to the peer. Answers how many bytes were put in `out`.
+    //
+    // **Call it until it answers zero, after every other call.** OpenSSL produces bytes to send from
+    // reading as well as from writing -- an alert, a session ticket, a renegotiation -- so a caller
+    // that only drained after `send` would stall.
+    outgoing(&self, out: []u8) -> usize
+        if out.len == 0 then return 0
+
+        val got = c.bio_read(self.wbio, &out[0], i32(out.len))
+
+        if got <= 0 then 0 else usize(got)
+    end outgoing
+
+    // How much is waiting to be written, for a caller sizing a buffer.
+    waiting(self) -> usize = c.bio_ctrl_pending(self.wbio)
+
+    // Drive the handshake as far as it will go.
+    handshake(&self) -> Result[Step, Error]
+        c.err_clear_error()
+
+        val r = c.ssl_do_handshake(self.ssl)
+
+        if r == 1 then return self.checked()
+
+        self.step_of(r)
+    end handshake
+
+    // Whether the handshake finished and the certificate was acceptable.
+    //
+    // **Both, and the second is not implied by the first.** `SSL_VERIFY_PEER` makes a bad chain
+    // abort the handshake, so this is a belt beside that brace -- and it is the check that would
+    // still be here if a later version of this package ever grew a way to relax the first.
+    private checked(&self) -> Result[Step, Error]
+        val verdict = c.ssl_get_verify_result(self.ssl)
+
+        if verdict != c.X509_V_OK
+            return Err(Error(c.SSL_ERROR_SSL, u64(verdict), s"the server's certificate was not acceptable (X509 code ${verdict})"))
+
+        Ok(Step.Done)
+    end checked
+
+    // Give the peer some plaintext.
+    send(&self, plaintext: []const u8) -> Result[Sent, Error]
+        if plaintext.len == 0 then return Ok(Sent.Took(0))
+
+        c.err_clear_error()
+
+        val r = c.ssl_write(self.ssl, &plaintext[0], i32(plaintext.len))
+
+        if r > 0 then return Ok(Sent.Took(usize(r)))
+
+        self.step_of(r) match
+            Ok(_) -> Ok(Sent.Wants)
+            Err(e) -> Err(e)
+    end send
+
+    // Take whatever plaintext has arrived.
+    receive(&self, out: []u8) -> Result[Received, Error]
+        if out.len == 0 then return Ok(Received.Data(0))
+
+        c.err_clear_error()
+
+        val r = c.ssl_read(self.ssl, &out[0], i32(out.len))
+
+        if r > 0 then return Ok(Received.Data(usize(r)))
+
+        val reason = c.ssl_get_error(self.ssl, r)
+
+        if reason == c.SSL_ERROR_ZERO_RETURN then return Ok(Received.Closed)
+
+        self.step_of(r) match
+            Ok(_) -> Ok(Received.Wants)
+            Err(e) -> Err(e)
+    end receive
+
+    // Say goodbye. **Answered rather than insisted on**: a close-notify has to be written like
+    // anything else, so the caller drains `outgoing` afterwards.
+    close(&self) -> Step
+        if c.ssl_shutdown(self.ssl) == 1 then Step.Done else Step.Wants
+    end close
+
+    // What a non-positive answer meant.
+    //
+    // **This is the one place `SSL_get_error` is read**, and everything above routes through it, so
+    // there is one rule for what OpenSSL's `-1` means rather than five.
+    private step_of(&self, r: i32) -> Result[Step, Error]
+        val reason = c.ssl_get_error(self.ssl, r)
+
+        if reason == c.SSL_ERROR_WANT_READ || reason == c.SSL_ERROR_WANT_WRITE
+            return Ok(Step.Wants)
+
+        if reason == c.SSL_ERROR_ZERO_RETURN
+            return Err(fail(reason, "the peer closed the TLS session"))
+
+        if reason == c.SSL_ERROR_SYSCALL
+            return Err(fail(reason, "the connection under TLS failed"))
+
+        Err(fail(reason, "TLS failed"))
+    end step_of
+end Stream
+
+impl Drop for Stream
+    // **`SSL_free` FREES BOTH BUFFERS, because `SSL_set_bio` took ownership of them.** Freeing them
+    // here as well is a double free, and it is silent until it is not. This is OpenSSL's oldest
+    // trap and the reason the two fields above say so.
+    drop(self) = c.ssl_free(self.ssl)
+
+// Begin a session with a named host.
+//
+// **The host is used twice and both are mandatory.** It goes out in the handshake as SNI, without
+// which a shared server does not know which certificate to send -- GitHub answers nothing at all --
+// and it is what the certificate's names are checked against, without which a valid certificate for
+// any host would satisfy the verification.
+connect(of: &Client, host: string) -> Result[&Stream, Error]
+    c.err_clear_error()
+
+    val ssl = c.ssl_new(of.ctx)
+
+    if ssl == null then return Err(fail(c.SSL_ERROR_SSL, "could not begin a TLS session"))
+
+    val rbio = c.bio_new(c.bio_s_mem())
+    val wbio = c.bio_new(c.bio_s_mem())
+
+    if rbio == null || wbio == null
+        c.ssl_free(ssl)
+
+        return Err(fail(c.SSL_ERROR_SSL, "could not make the buffers a TLS session is driven through"))
+    end if
+
+    // From here on the buffers belong to `ssl`, so every way out frees only that.
+    c.ssl_set_bio(ssl, rbio, wbio)
+
+    val name = cstring(host)
+
+    if c.ssl_set1_host(ssl, name.ptr) != 1
+        c.ssl_free(ssl)
+
+        return Err(fail(c.SSL_ERROR_SSL, s"`${host}` is not a host name a certificate could be checked against"))
+    end if
+
+    c.ssl_ctrl(ssl, c.SSL_CTRL_SET_TLSEXT_HOSTNAME, i64(c.TLSEXT_NAMETYPE_host_name), name.ptr)
+    c.ssl_set_connect_state(ssl)
+
+    Ok(Stream(ssl, rbio, wbio, of))
+end connect

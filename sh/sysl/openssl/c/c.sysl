@@ -1,0 +1,140 @@
+// OpenSSL, declared verbatim.
+//
+// **The declarations over the library the machine has.** Nothing here is meant to be called by a
+// program: every name and every convention is C's, so a handle is a pointer OpenSSL allocated, a
+// failure is a non-positive integer whose meaning has to be asked for separately, and a string is a
+// `*u8` somebody else owns. The module above turns those into sysl and is what an application
+// imports.
+//
+// **Each declaration was read out of the header rather than remembered**, because a signature that
+// disagrees with OpenSSL's links perfectly and corrupts the call at run time, and nothing in this
+// arrangement checks one against the other.
+//
+// **THIS IS A PARTIAL BINDING AND SAYS SO.** OpenSSL's surface is thousands of functions; what is
+// here is a TLS *client* over memory buffers, which is twenty-odd of them. Adding to it is ordinary
+// -- the rule is only that what is here is faithful, not that it is complete.
+//
+// **There is no C shim, which is worth knowing because two things look like they need one.**
+// `SSL_set_tlsext_host_name` and `SSL_CTX_set_min_proto_version` are macros, so they have no
+// symbols; both expand to `SSL_ctrl`/`SSL_CTX_ctrl` with an integer command, and those are ordinary
+// functions. The commands are constants at the end of this file, read from the same headers, so the
+// numbers are the machine's rather than this file's.
+
+module sh.sysl.openssl.c
+@link("ssl")
+@link("crypto")
+
+@include("openssl/ssl.h")
+@include("openssl/bio.h")
+@include("openssl/err.h")
+@include("openssl/x509_vfy.h")
+
+// ## The handles
+//
+// Every one of these is a struct OpenSSL allocates and hands back a pointer to. `opaque struct` is
+// that claim, and it is what stops an `SSL` being passed where a `BIO` is wanted.
+//
+// **Ownership is OpenSSL's and the layer above frees each one exactly once.** That is the shape
+// `sqlite3` binds too -- `sqlite3_open_v2` gives a pointer and `sqlite3_close` takes it back -- and
+// it is why nothing here is carried in caller storage the way a libuv handle is.
+
+opaque struct SslCtx
+opaque struct Ssl
+opaque struct Bio
+opaque struct BioMethod
+opaque struct SslMethod
+
+// ## Making a context
+//
+// A context is the settings -- which protocol versions, which certificates to trust -- and is made
+// once and shared by every connection under it. `SSL_new` takes a reference on it, so it has to
+// outlive the connections.
+
+extern "TLS_client_method" tls_client_method() -> *SslMethod
+extern "SSL_CTX_new" ctx_new(method: *SslMethod) -> *SslCtx
+extern "SSL_CTX_free" ctx_free(ctx: *SslCtx)
+
+// **`callback` is a function pointer and null means "OpenSSL's own".** It is declared `*u8` because
+// the only value this binding ever passes is null: a verify callback is how a program overrides the
+// decision, and a package that offered that would be offering a way to accept a bad certificate.
+extern "SSL_CTX_set_verify" ctx_set_verify(ctx: *SslCtx, mode: i32, callback: *u8)
+
+// Trust the machine's certificate store -- `/etc/ssl/certs` and its relatives, wherever this build
+// of OpenSSL was told they are. Answers 1 on success.
+extern "SSL_CTX_set_default_verify_paths" ctx_set_default_verify_paths(ctx: *SslCtx) -> i32
+
+// The general setting call every `SSL_CTX_set_*` macro expands to.
+extern "SSL_CTX_ctrl" ctx_ctrl(ctx: *SslCtx, cmd: i32, larg: i64, parg: *u8) -> i64
+
+// ## One connection
+
+extern "SSL_new" ssl_new(ctx: *SslCtx) -> *Ssl
+extern "SSL_free" ssl_free(ssl: *Ssl)
+
+// **`SSL_set_bio` TAKES OWNERSHIP OF BOTH BUFFERS.** They are freed by `SSL_free` and freeing them
+// separately is a double free. This is OpenSSL's oldest trap and it is silent until it is not.
+extern "SSL_set_bio" ssl_set_bio(ssl: *Ssl, rbio: *Bio, wbio: *Bio)
+
+extern "SSL_set_connect_state" ssl_set_connect_state(ssl: *Ssl)
+
+// Check the certificate's names against this host. **Enabling the check is what this call is for**;
+// without it a valid certificate for any host at all would satisfy the verification.
+extern "SSL_set1_host" ssl_set1_host(ssl: *Ssl, host: *u8) -> i32
+
+extern "SSL_do_handshake" ssl_do_handshake(ssl: *Ssl) -> i32
+extern "SSL_read" ssl_read(ssl: *Ssl, buf: *u8, num: i32) -> i32
+extern "SSL_write" ssl_write(ssl: *Ssl, buf: *u8, num: i32) -> i32
+extern "SSL_shutdown" ssl_shutdown(ssl: *Ssl) -> i32
+
+// What a non-positive answer from the three above meant. **It is not `errno` and not a return
+// code**: it says whether OpenSSL wants more bytes, has bytes to send, or has genuinely failed.
+extern "SSL_get_error" ssl_get_error(ssl: *Ssl, ret: i32) -> i32
+
+// Whether the certificate chain checked out. `X509_V_OK` is zero.
+extern "SSL_get_verify_result" ssl_get_verify_result(ssl: *Ssl) -> i64
+
+// Decrypted bytes already held, which a reader has to drain before waiting on the socket again.
+extern "SSL_pending" ssl_pending(ssl: *Ssl) -> i32
+
+// The general setting call every `SSL_set_*` macro expands to.
+extern "SSL_ctrl" ssl_ctrl(ssl: *Ssl, cmd: i32, larg: i64, parg: *u8) -> i64
+
+// ## The two memory buffers
+//
+// **This is the whole reason the binding is small.** OpenSSL is not given the socket: it is given a
+// pair of in-memory buffers, so it becomes a byte-stream transformer -- ciphertext in, plaintext
+// out, and back. Node does exactly this, which is why `tls.TLSSocket` wraps a `net.Socket` rather
+// than replacing it, and it is what lets one binding serve a blocking fetch and an event loop
+// without knowing which it is in.
+
+extern "BIO_s_mem" bio_s_mem() -> *BioMethod
+extern "BIO_new" bio_new(method: *BioMethod) -> *Bio
+extern "BIO_free" bio_free(b: *Bio) -> i32
+extern "BIO_read" bio_read(b: *Bio, data: *u8, len: i32) -> i32
+extern "BIO_write" bio_write(b: *Bio, data: *u8, len: i32) -> i32
+extern "BIO_ctrl_pending" bio_ctrl_pending(b: *Bio) -> usize
+
+// ## Errors
+
+extern "ERR_get_error" err_get_error() -> u64
+extern "ERR_clear_error" err_clear_error()
+extern "ERR_error_string_n" err_error_string_n(e: u64, buf: *u8, len: usize)
+
+// ## The numbers
+//
+// **Read from the machine's headers rather than written here**, so a build against a different
+// OpenSSL gets that OpenSSL's values. The two `ctrl` commands are what make the macros unnecessary.
+
+c const
+    SSL_ERROR_NONE: i32 = "SSL_ERROR_NONE"
+    SSL_ERROR_SSL: i32 = "SSL_ERROR_SSL"
+    SSL_ERROR_WANT_READ: i32 = "SSL_ERROR_WANT_READ"
+    SSL_ERROR_WANT_WRITE: i32 = "SSL_ERROR_WANT_WRITE"
+    SSL_ERROR_ZERO_RETURN: i32 = "SSL_ERROR_ZERO_RETURN"
+    SSL_ERROR_SYSCALL: i32 = "SSL_ERROR_SYSCALL"
+    SSL_VERIFY_PEER: i32 = "SSL_VERIFY_PEER"
+    SSL_CTRL_SET_TLSEXT_HOSTNAME: i32 = "SSL_CTRL_SET_TLSEXT_HOSTNAME"
+    SSL_CTRL_SET_MIN_PROTO_VERSION: i32 = "SSL_CTRL_SET_MIN_PROTO_VERSION"
+    TLSEXT_NAMETYPE_host_name: i32 = "TLSEXT_NAMETYPE_host_name"
+    TLS1_2_VERSION: i32 = "TLS1_2_VERSION"
+    X509_V_OK: i64 = "X509_V_OK"
