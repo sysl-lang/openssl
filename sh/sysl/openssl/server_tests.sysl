@@ -1,0 +1,275 @@
+// What the server half claims, run without a network.
+//
+// **Two `Stream`s in one process, with their buffers crossed by hand.** That is what the memory-BIO
+// shape is for: the whole protocol -- a handshake, a certificate check, an ALPN negotiation, bytes
+// each way and a goodbye -- is driven here with no socket, no port and no permission to bind one.
+// A suite that needed the network would fail on a train and would be skipped, which is how a
+// binding comes to have no test of the thing it is for.
+
+module sh.sysl.openssl
+@tests
+
+import sh.sysl.openssl.c
+import sysl.harness.*
+import sysl.text.from_utf8_unchecked
+
+// A self-signed certificate for `localhost`, and the key that goes with it. **Generated once with
+// `openssl req -x509 -newkey ec`, and good until 2126** -- a fixture with a near expiry is a test
+// that fails on a date nobody chose.
+//
+// **A function rather than a module-level `val`.** A binding whose module storage has to be filled
+// before anything runs cannot be built for a board at all, and a host suite is perfectly green
+// about it.
+private certificate() -> string = raw"""
+    -----BEGIN CERTIFICATE-----
+    MIIBlTCCATugAwIBAgIUNnjUBn4q7ivoXFJz0saQZ08Pg5swCgYIKoZIzj0EAwIw
+    FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDgyOTE3NTA0NVoYDzIxMjYwODA1
+    MTc1MDQ1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+    PQMBBwNCAARZbqWolNURbZ5e+9vJOe4TUurlpW+RHEs8akmv+IIIIA/rj97/iCuM
+    BhyvxVOtuyLYisY/u8tssfGB9Ae2cToOo2kwZzAdBgNVHQ4EFgQUVFT1Ath9z+UO
+    ZTtYvB+5kS4sWbowHwYDVR0jBBgwFoAUVFT1Ath9z+UOZTtYvB+5kS4sWbowDwYD
+    VR0TAQH/BAUwAwEB/zAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwID
+    SAAwRQIgT5Z9B0gkwqI38hKMz4j6Qfz7soV1nIJDkQL2ybMM/v8CIQDL4P1sRuQe
+    l1AsfZSnSUHdcgf31iyWtYdG7TDjTT1SSQ==
+    -----END CERTIFICATE-----
+    """
+
+private key() -> string = raw"""
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgBb9GvwtNPeyKbu1H
+    iKg570Z07OItc1S5qkEx3mMK0HGhRANCAARZbqWolNURbZ5e+9vJOe4TUurlpW+R
+    HEs8akmv+IIIIA/rj97/iCuMBhyvxVOtuyLYisY/u8tssfGB9Ae2cToO
+    -----END PRIVATE KEY-----
+    """
+
+// A second, unrelated key -- the same kind, so that what a mismatch test catches is the pairing
+// rather than the algorithm.
+private other_key() -> string = raw"""
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgaSLnfIcCjA4l//og
+    +XYWf1EzDi6UCmf9w+KMjZFRaaqhRANCAARnyo4mQRIqCzHriLjrsW0rd9P3gj4j
+    7xl01m72G0xGnkb5h6+62Xe3UCHL9HE70lJjkhX1F4HRxEaBbtU2T1wG
+    -----END PRIVATE KEY-----
+    """
+
+// Move everything one end has to send to the other. Answers how many bytes crossed.
+private pump(from: &Stream, to: &Stream) -> usize
+    var out: [16384]u8
+    var moved: usize = 0
+
+    loop
+        val n = from.outgoing(out[0..<16384])
+
+        if n == 0 then break
+
+        to.incoming(out[0..<n]).unwrap()
+
+        moved += n
+    end loop
+
+    moved
+end pump
+
+// Drive both ends until the handshake settles, or give up.
+//
+// **The order matters and is the one the module comment prescribes**: ask for progress first, drain
+// second. Draining first sends nothing, and both ends then wait for each other forever -- which
+// here would be a hang rather than a failed assertion, so the round count is the safety net.
+private settle(cl: &Stream, sv: &Stream) -> Result[unit, Error]
+    for round in 0..<16
+        val a = cl.handshake()?
+
+        pump(cl, sv)
+
+        val b = sv.handshake()?
+
+        pump(sv, cl)
+
+        if a == Step.Done && b == Step.Done then return Ok(())
+    end for
+
+    Err(fail(c.SSL_ERROR_SSL, "the handshake never settled"))
+end settle
+
+// A client that trusts the fixture above and nothing else new.
+private trusting() -> &Client
+    val cl = client().unwrap()
+
+    cl.trust(certificate().bytes).unwrap()
+
+    cl
+end trusting
+
+@test
+a_certificate_and_the_key_that_goes_with_it_make_a_server()
+    assert(server(certificate().bytes, key().bytes).is_ok())
+
+@test
+a_key_that_does_not_go_with_the_certificate_is_refused()
+    // **Nothing else catches this.** Both installs succeed on a mismatched pair and the handshake
+    // then fails at the *peer*, with a decrypt error that says nothing about this end.
+    val made = server(certificate().bytes, other_key().bytes)
+
+    assert(made.is_err(), "a certificate and an unrelated key were accepted as a pair")
+    assert(made.unwrap_err().message.len > 12)
+
+@test
+bytes_that_are_not_a_certificate_are_refused()
+    assert(server("not a certificate".bytes, key().bytes).is_err())
+    assert(server(certificate().bytes, "not a key".bytes).is_err())
+
+@test
+a_handshake_completes_between_two_streams_with_no_socket_at_all()
+    val sv = server(certificate().bytes, key().bytes).unwrap()
+    val cl = trusting()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    settle(a, b).unwrap()
+
+    // Plaintext each way, through the real record layer.
+    a.send("ping".bytes).unwrap() match
+        Took(n) -> assert_eq(n, 4)
+        Wants -> assert(false, "a settled connection would not take four bytes")
+
+    pump(a, b)
+
+    var got: [64]u8
+
+    b.receive(got[0..<64]).unwrap() match
+        Data(n) -> assert_eq(from_utf8_unchecked(got[0..<n]), "ping")
+        Wants -> assert(false, "the server saw no plaintext after the client sent some")
+        Closed -> assert(false, "the server saw a closed session")
+
+    b.send("pong".bytes).unwrap()
+
+    pump(b, a)
+
+    a.receive(got[0..<64]).unwrap() match
+        Data(n) -> assert_eq(from_utf8_unchecked(got[0..<n]), "pong")
+        Wants -> assert(false, "the client saw no reply")
+        Closed -> assert(false, "the client saw a closed session")
+
+    // **A goodbye is bytes like everything else**, so it has to be drained before the other end
+    // can see it.
+    a.close()
+
+    pump(a, b)
+
+    b.receive(got[0..<64]).unwrap() match
+        Closed -> ()
+        Data(_) -> assert(false, "a closed session delivered data")
+        Wants -> assert(false, "a close-notify was written and the peer did not see it")
+
+@test
+a_client_that_does_not_trust_the_certificate_refuses_it()
+    // **The check that makes the one above mean something.** A handshake that completes against a
+    // client which would have accepted anything proves nothing about verification.
+    val sv = server(certificate().bytes, key().bytes).unwrap()
+    val cl = client().unwrap()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    assert(settle(a, b).is_err(), "a self-signed certificate satisfied the machine's trust store")
+
+@test
+a_certificate_for_the_wrong_host_is_refused()
+    // Trusted, and still wrong: the name is checked separately from the chain.
+    val sv = server(certificate().bytes, key().bytes).unwrap()
+    val cl = trusting()
+
+    val a = connect(cl, "somewhere.else.example.com").unwrap()
+    val b = accept(sv).unwrap()
+
+    assert(settle(a, b).is_err(), "a certificate for `localhost` satisfied a connection to another host")
+
+@test
+alpn_settles_on_the_servers_preference_rather_than_the_clients()
+    // **The two lists disagree on purpose.** With both ends offering the same pair in opposite
+    // orders, the protocol chosen is the whole evidence of whose order won -- and a test where they
+    // agreed would pass whichever end this package deferred to.
+    val sv = server(certificate().bytes, key().bytes).unwrap()
+
+    sv.offer(["h2", "http/1.1"]).unwrap()
+
+    val cl = trusting()
+
+    cl.offer(["http/1.1", "h2"]).unwrap()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    settle(a, b).unwrap()
+
+    assert_eq(a.protocol().unwrap(), "h2")
+    assert_eq(b.protocol().unwrap(), "h2")
+
+@test
+alpn_picks_the_one_both_ends_have()
+    val sv = server(certificate().bytes, key().bytes).unwrap()
+
+    sv.offer(["h2", "http/1.1"]).unwrap()
+
+    val cl = trusting()
+
+    cl.offer(["http/1.1"]).unwrap()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    settle(a, b).unwrap()
+
+    assert_eq(a.protocol().unwrap(), "http/1.1")
+
+@test
+alpn_with_nothing_in_common_fails_the_handshake()
+    // **Refusing is right, and it is a decision.** RFC 7301 asks for it: carrying on would leave the
+    // peer to guess what it is speaking to.
+    val sv = server(certificate().bytes, key().bytes).unwrap()
+
+    sv.offer(["h2"]).unwrap()
+
+    val cl = trusting()
+
+    cl.offer(["spdy/3"]).unwrap()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    assert(settle(a, b).is_err(), "two ends with no protocol in common completed a handshake")
+
+@test
+a_connection_where_nobody_offered_anything_negotiates_nothing()
+    val sv = server(certificate().bytes, key().bytes).unwrap()
+    val cl = trusting()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    settle(a, b).unwrap()
+
+    // **`None` is an ordinary answer rather than a failure.**
+    assert(a.protocol().is_none())
+    assert(b.protocol().is_none())
+
+@test
+a_server_that_offers_nothing_leaves_a_clients_offer_unanswered()
+    val sv = server(certificate().bytes, key().bytes).unwrap()
+    val cl = trusting()
+
+    cl.offer(["h2", "http/1.1"]).unwrap()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    settle(a, b).unwrap()
+
+    assert(a.protocol().is_none(), "a server offering nothing agreed to a protocol anyway")
+
+@test
+a_protocol_name_alpn_cannot_carry_is_refused()
+    val cl = client().unwrap()
+
+    assert(cl.offer([""]).is_err(), "an empty protocol name was accepted")

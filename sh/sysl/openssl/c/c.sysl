@@ -11,8 +11,9 @@
 // arrangement checks one against the other.
 //
 // **THIS IS A PARTIAL BINDING AND SAYS SO.** OpenSSL's surface is thousands of functions; what is
-// here is a TLS *client* over memory buffers, which is twenty-odd of them. Adding to it is ordinary
-// -- the rule is only that what is here is faithful, not that it is complete.
+// here is TLS over memory buffers -- both ends of it -- plus the digest signing a token needs, which
+// is fifty-odd of them. Adding to it is ordinary -- the rule is only that what is here is faithful,
+// not that it is complete.
 //
 // **There is no C shim, which is worth knowing because two things look like they need one.**
 // `SSL_set_tlsext_host_name` and `SSL_CTX_set_min_proto_version` are macros, so they have no
@@ -28,6 +29,9 @@ module sh.sysl.openssl.c
 @include("openssl/bio.h")
 @include("openssl/err.h")
 @include("openssl/x509_vfy.h")
+@include("openssl/pem.h")
+@include("openssl/evp.h")
+@include("openssl/rsa.h")
 
 // ## The handles
 //
@@ -44,6 +48,23 @@ opaque struct Bio
 opaque struct BioMethod
 opaque struct SslMethod
 
+// A parsed certificate, and a parsed key. **Both are reference-counted inside OpenSSL**, so
+// `SSL_CTX_use_certificate` and `SSL_CTX_use_PrivateKey` take a reference of their own and the
+// caller still owes the `X509_free`/`EVP_PKEY_free` for the one it was handed.
+opaque struct X509
+opaque struct EvpPkey
+
+// The set of certificates a client will build a path to. **Owned by the context**, so it is
+// borrowed rather than freed.
+opaque struct X509Store
+
+// The digest, the running digest, and the key settings hanging off one. **`EvpPkeyCtx` is borrowed
+// rather than owned**: `EVP_DigestSignInit` hands one back that belongs to the `EVP_MD_CTX`, and
+// freeing it separately is a double free.
+opaque struct EvpMd
+opaque struct EvpMdCtx
+opaque struct EvpPkeyCtx
+
 // ## Making a context
 //
 // A context is the settings -- which protocol versions, which certificates to trust -- and is made
@@ -51,6 +72,7 @@ opaque struct SslMethod
 // outlive the connections.
 
 extern "TLS_client_method" tls_client_method() -> *SslMethod
+extern "TLS_server_method" tls_server_method() -> *SslMethod
 extern "SSL_CTX_new" ctx_new(method: *SslMethod) -> *SslCtx
 extern "SSL_CTX_free" ctx_free(ctx: *SslCtx)
 
@@ -76,6 +98,10 @@ extern "SSL_free" ssl_free(ssl: *Ssl)
 extern "SSL_set_bio" ssl_set_bio(ssl: *Ssl, rbio: *Bio, wbio: *Bio)
 
 extern "SSL_set_connect_state" ssl_set_connect_state(ssl: *Ssl)
+
+// The other end. **This is the whole of what makes a connection a server's**: the state machine
+// waits for a ClientHello instead of writing one, and every other call above is unchanged.
+extern "SSL_set_accept_state" ssl_set_accept_state(ssl: *Ssl)
 
 // Check the certificate's names against this host. **Enabling the check is what this call is for**;
 // without it a valid certificate for any host at all would satisfy the verification.
@@ -120,6 +146,87 @@ extern "ERR_get_error" err_get_error() -> u64
 extern "ERR_clear_error" err_clear_error()
 extern "ERR_error_string_n" err_error_string_n(e: u64, buf: *u8, len: usize)
 
+// ## A certificate and a key, read from bytes
+//
+// **PEM comes in through a `BIO` rather than through a file name, and that is a decision.** OpenSSL
+// has `SSL_CTX_use_certificate_chain_file` and it would be one call instead of five -- but this
+// package's whole shape is that OpenSSL is never given the socket, and handing it the *filesystem*
+// instead is the same leak wearing a different hat. Bytes may have come from a file, from a secret
+// store, from an environment variable or from a test's own string, and the package neither knows nor
+// asks.
+
+// A read-only buffer dressed as a `BIO`. **Not owned by anything**, so it is freed with `BIO_free`
+// -- unlike the pair handed to `SSL_set_bio`.
+extern "BIO_new_mem_buf" bio_new_mem_buf(buf: *u8, len: i32) -> *Bio
+
+// Read one PEM object. **Answers null at the end of the buffer as well as on a bad one**, which is
+// how a chain is read: call until it stops, and ask the error queue which of the two happened.
+extern "PEM_read_bio_X509" pem_read_bio_x509(b: *Bio, x: **X509, cb: *u8, u: *u8) -> *X509
+extern "PEM_read_bio_PrivateKey" pem_read_bio_private_key(b: *Bio, x: **EvpPkey, cb: *u8, u: *u8) -> *EvpPkey
+extern "PEM_read_bio_PUBKEY" pem_read_bio_pubkey(b: *Bio, x: **EvpPkey, cb: *u8, u: *u8) -> *EvpPkey
+
+extern "X509_free" x509_free(x: *X509)
+extern "EVP_PKEY_free" pkey_free(p: *EvpPkey)
+
+// Which family a key belongs to, as a NID. **Worth asking**: verifying an ES256 signature with an
+// RSA key is a category error a caller can make by wiring a JWKS entry to the wrong algorithm.
+extern "EVP_PKEY_get_base_id" pkey_base_id(p: *EvpPkey) -> i32
+
+// The trust store a context verifies against, and how one more certificate is added to it.
+// **Additive only** -- there is nothing here that lowers the bar, which is deliberate.
+extern "SSL_CTX_get_cert_store" ctx_get_cert_store(ctx: *SslCtx) -> *X509Store
+extern "X509_STORE_add_cert" store_add_cert(store: *X509Store, x: *X509) -> i32
+
+extern "SSL_CTX_use_certificate" ctx_use_certificate(ctx: *SslCtx, x: *X509) -> i32
+extern "SSL_CTX_use_PrivateKey" ctx_use_private_key(ctx: *SslCtx, pkey: *EvpPkey) -> i32
+
+// Whether the key goes with the certificate. **A mismatch is not caught anywhere else**: both calls
+// above succeed, and the handshake then fails at the peer with a decrypt error.
+extern "SSL_CTX_check_private_key" ctx_check_private_key(ctx: *SslCtx) -> i32
+
+// ## ALPN
+//
+// How a client and a server agree on `http/1.1` versus `h2` inside the handshake, so that no round
+// trip is spent asking. The wire form is the same both ways: each name is a length byte followed by
+// that many bytes, one after another.
+
+extern "SSL_CTX_set_alpn_protos" ctx_set_alpn_protos(ctx: *SslCtx, protos: *u8, len: u32) -> i32
+
+// **The server side is a callback, because the server chooses.** It is handed the client's list and
+// writes back a pointer into storage that has to outlive the call.
+extern "SSL_CTX_set_alpn_select_cb" ctx_set_alpn_select_cb(ctx: *SslCtx,
+    cb: *extern(*Ssl, **u8, *u8, *u8, u32, *u8) -> i32, arg: *u8)
+
+// What was agreed. **Answers a zero length rather than failing** when nothing was.
+extern "SSL_get0_alpn_selected" ssl_get0_alpn_selected(ssl: *Ssl, data: **u8, len: *u32)
+
+// ## Signing and verifying a digest
+//
+// The EVP tier rather than the RSA and EC ones, so that one pair of calls covers every key type and
+// the algorithm is a choice of digest plus a padding setting.
+
+extern "EVP_MD_CTX_new" md_ctx_new() -> *EvpMdCtx
+extern "EVP_MD_CTX_free" md_ctx_free(ctx: *EvpMdCtx)
+
+extern "EVP_sha256" sha256() -> *EvpMd
+extern "EVP_sha384" sha384() -> *EvpMd
+extern "EVP_sha512" sha512() -> *EvpMd
+
+// **`pctx` is an out-parameter and what comes back is borrowed.** It is how the padding is set for
+// PSS, and it belongs to the `EVP_MD_CTX` -- freeing it is a double free.
+extern "EVP_DigestVerifyInit" digest_verify_init(ctx: *EvpMdCtx, pctx: **EvpPkeyCtx, ty: *EvpMd, e: *u8, pkey: *EvpPkey) -> i32
+extern "EVP_DigestSignInit" digest_sign_init(ctx: *EvpMdCtx, pctx: **EvpPkeyCtx, ty: *EvpMd, e: *u8, pkey: *EvpPkey) -> i32
+
+// **One-shot rather than update-and-final**, which is what a token wants: the whole signing input is
+// in hand, and Ed25519 accepts nothing else.
+extern "EVP_DigestVerify" digest_verify(ctx: *EvpMdCtx, sig: *u8, siglen: usize, tbs: *u8, tbslen: usize) -> i32
+
+// **Called twice.** A null `sig` asks how much room the signature needs; the second call fills it.
+extern "EVP_DigestSign" digest_sign(ctx: *EvpMdCtx, sig: *u8, siglen: *usize, tbs: *u8, tbslen: usize) -> i32
+
+extern "EVP_PKEY_CTX_set_rsa_padding" pkey_ctx_set_rsa_padding(ctx: *EvpPkeyCtx, mode: i32) -> i32
+extern "EVP_PKEY_CTX_set_rsa_pss_saltlen" pkey_ctx_set_rsa_pss_saltlen(ctx: *EvpPkeyCtx, len: i32) -> i32
+
 // ## The numbers
 //
 // **Read from the machine's headers rather than written here**, so a build against a different
@@ -138,3 +245,25 @@ c const
     TLSEXT_NAMETYPE_host_name: i32 = "TLSEXT_NAMETYPE_host_name"
     TLS1_2_VERSION: i32 = "TLS1_2_VERSION"
     X509_V_OK: i64 = "X509_V_OK"
+
+c const
+    // What `SSL_CTX_add1_chain_cert` expands to, so a chain needs no macro.
+    SSL_CTRL_CHAIN_CERT: i32 = "SSL_CTRL_CHAIN_CERT"
+
+    // What an ALPN callback answers. **`NOACK` is not a failure**: it declines to negotiate and the
+    // handshake carries on without a protocol, which is what a server offering nothing should do.
+    SSL_TLSEXT_ERR_OK: i32 = "SSL_TLSEXT_ERR_OK"
+    SSL_TLSEXT_ERR_ALERT_FATAL: i32 = "SSL_TLSEXT_ERR_ALERT_FATAL"
+    SSL_TLSEXT_ERR_NOACK: i32 = "SSL_TLSEXT_ERR_NOACK"
+
+    // Key families, as NIDs. **`RSA_PSS` is a different one from `RSA`** -- a key generated as
+    // RSASSA-PSS refuses PKCS#1 v1.5 signing outright.
+    EVP_PKEY_RSA: i32 = "EVP_PKEY_RSA"
+    EVP_PKEY_RSA_PSS: i32 = "EVP_PKEY_RSA_PSS"
+    EVP_PKEY_EC: i32 = "EVP_PKEY_EC"
+
+    RSA_PKCS1_PSS_PADDING: i32 = "RSA_PKCS1_PSS_PADDING"
+
+    // **A salt the length of the digest, which is what JOSE's PS256 specifies** -- and a negative
+    // number, so a binding carrying it as an unsigned width would mean something else entirely.
+    RSA_PSS_SALTLEN_DIGEST: i32 = "RSA_PSS_SALTLEN_DIGEST"

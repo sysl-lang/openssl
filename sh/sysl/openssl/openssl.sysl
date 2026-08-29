@@ -33,7 +33,9 @@
 module sh.sysl.openssl
 
 import sh.sysl.openssl.c
-import sysl.text.{cstring, from_cstring}
+import sysl.text.{cstring, from_cstring, from_utf8_unchecked}
+import sysl.slices.as_ptr
+import sysl.buf.{Buf, buf}
 
 // What went wrong, in OpenSSL's own words where it has any.
 //
@@ -50,7 +52,7 @@ end Error
 impl Display for Error
     display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message, out, fmt)
 
-private fail(reason: i32, what: string) -> Error
+private[openssl] fail(reason: i32, what: string) -> Error
     val code = c.err_get_error()
 
     if code == 0 then return Error(reason, 0, what)
@@ -99,6 +101,71 @@ end Sent
 // which is why a `Stream` holds its client rather than only its pointer.
 struct Client
     ctx: *c.SslCtx
+
+    // Trust one more certificate authority, on top of the machine's own store.
+    //
+    // **Additive, and there is deliberately nothing here that lowers the bar.** A private authority,
+    // a corporate root, or the self-signed certificate a test stands up are all the same case: more
+    // is trusted, never less. The PEM may hold several, and every one of them is added.
+    trust(&self, pem: []const u8) -> Result[unit, Error]
+        if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "there was nothing to trust"))
+
+        val store = c.ctx_get_cert_store(self.ctx)
+
+        if store == null then return Err(fail(c.SSL_ERROR_SSL, "this context has no trust store"))
+
+        val bio = c.bio_new_mem_buf(as_ptr(pem), i32(pem.len))
+
+        if bio == null then return Err(fail(c.SSL_ERROR_SSL, "could not read the certificate"))
+
+        var found: usize = 0
+        var trouble: Option[Error] = None
+
+        loop
+            val x = c.pem_read_bio_x509(bio, null, null, null)
+
+            if x == null then break
+
+            // **`add_cert` takes a reference of its own**, so the one handed over is still owed a
+            // free -- and a duplicate is refused rather than counted, which is why the answer is
+            // read but a repeat is not an error worth reporting.
+            val rc = c.store_add_cert(store, x)
+
+            c.x509_free(x)
+
+            if rc != 1
+                trouble = Some(fail(c.SSL_ERROR_SSL, "that certificate was refused"))
+                break
+
+            found += 1
+        end loop
+
+        c.bio_free(bio)
+
+        trouble match
+            Some(e) -> return Err(e)
+            None -> ()
+
+        if found == 0 then return Err(fail(c.SSL_ERROR_SSL, "there was no certificate in those bytes"))
+
+        Ok(())
+    end trust
+
+    // Offer these application protocols, most preferred first.
+    //
+    // **The list is copied by OpenSSL here and is not on the server side**, which is the asymmetry
+    // to know: a client hands over bytes and forgets them, a server hands over a pointer the
+    // callback will read later.
+    offer(&self, protocols: []const string) -> Result[unit, Error]
+        val list = encode(protocols)?
+
+        // **Zero is success.** Almost every other call in OpenSSL answers 1, and this one answers 0
+        // -- a binding that checked for 1 would report every successful call as a failure.
+        if c.ctx_set_alpn_protos(self.ctx, as_ptr(list.view()), u32(list.len())) != 0
+            return Err(fail(c.SSL_ERROR_SSL, "the protocol list was refused"))
+
+        Ok(())
+    end offer
 end Client
 
 impl Drop for Client
@@ -148,8 +215,10 @@ struct Stream
     // Ciphertext to be written, on its way out.
     wbio: *c.Bio
 
-    // Held so the context cannot be freed while this connection refers to it.
-    of: &Client
+    // Held so the context cannot be freed while this connection refers to it. **Private, and an
+    // enum rather than one type**, because a `Stream` is the same object at both ends and the only
+    // thing that differs is which context made it.
+    private under: Under
 
     // Hand over ciphertext that arrived from the peer.
     incoming(&self, bytes: []const u8) -> Result[unit, Error]
@@ -196,6 +265,13 @@ struct Stream
     // abort the handshake, so this is a belt beside that brace -- and it is the check that would
     // still be here if a later version of this package ever grew a way to relax the first.
     private checked(&self) -> Result[Step, Error]
+        // **A server asked for no certificate, so there is none to be unhappy about.** OpenSSL
+        // answers `X509_V_OK` when it verified nothing, which would pass -- saying so here means
+        // the check reads as deliberate rather than as something that happens to hold.
+        self.under match
+            AsServer(_) -> return Ok(Step.Done)
+            AsClient(_) -> ()
+
         val verdict = c.ssl_get_verify_result(self.ssl)
 
         if verdict != c.X509_V_OK
@@ -238,6 +314,20 @@ struct Stream
             Err(e) -> Err(e)
     end receive
 
+    // Which application protocol the two ends agreed on, if they agreed on one.
+    //
+    // **Readable only once the handshake is done**, since it is settled inside it -- and `None` is
+    // an ordinary answer rather than a failure: a client that offered nothing, or a peer that
+    // supports no ALPN at all, leaves it unset and the connection is fine.
+    protocol(&self) -> Option[string]
+        var name: *u8 = ptr_cast(0usize)
+        var len: u32 = 0
+
+        c.ssl_get0_alpn_selected(self.ssl, &name, &len)
+
+        if len == 0 then None else Some(from_utf8_unchecked(name[0..<usize(len)]))
+    end protocol
+
     // Say goodbye. **Answered rather than insisted on**: a close-notify has to be written like
     // anything else, so the caller drains `outgoing` afterwards.
     close(&self) -> Step
@@ -269,6 +359,13 @@ impl Drop for Stream
     // here as well is a double free, and it is silent until it is not. This is OpenSSL's oldest
     // trap and the reason the two fields above say so.
     drop(self) = c.ssl_free(self.ssl)
+
+// Which context a `Stream` is keeping alive. **Nothing reads which one it is** -- it exists so the
+// context outlives the connections `SSL_new` took a reference for.
+private[openssl] enum Under
+    AsClient(of: &Client)
+    AsServer(of: &Server)
+end Under
 
 // Begin a session with a named host.
 //
@@ -306,5 +403,251 @@ connect(of: &Client, host: string) -> Result[&Stream, Error]
     c.ssl_ctrl(ssl, c.SSL_CTRL_SET_TLSEXT_HOSTNAME, i64(c.TLSEXT_NAMETYPE_host_name), name.ptr)
     c.ssl_set_connect_state(ssl)
 
-    Ok(Stream(ssl, rbio, wbio, of))
+    Ok(Stream(ssl, rbio, wbio, Under.AsClient(of)))
 end connect
+
+// -- the protocols on offer -------------------------------------------------------------------------
+
+// The wire form of a protocol list: each name a length byte and then that many bytes.
+//
+// **Not a string with separators**, which is the shape a caller would guess at, so it is built here
+// once and both ends use it.
+private encode(protocols: []const string) -> Result[Buf[u8], Error]
+    var out: Buf[u8] = buf()
+
+    for name in protocols
+        val bytes = name.bytes
+
+        if bytes.len == 0 || bytes.len > 255
+            return Err(Error(c.SSL_ERROR_SSL, 0, s"`${name}` is not a protocol name ALPN can carry"))
+
+        out.push(u8(bytes.len))
+        out.extend(bytes)
+
+    Ok(out)
+end encode
+
+// -- a server ---------------------------------------------------------------------------------------
+
+// The settings every connection this end accepts will share: the certificate to present, the key
+// that goes with it, and the protocols on offer. Made once.
+//
+// **A `&Server` for the reason a `&Client` is one** -- `SSL_new` takes a reference on the context, so
+// a connection must not outlive it -- and for a second one: the ALPN callback is handed this
+// struct's own address, so it has to stay put.
+struct Server
+    ctx: *c.SslCtx
+
+    // The protocol list, kept because OpenSSL is given a pointer into it rather than a copy.
+    private protos: Buf[u8]
+
+    // That pointer and its length, taken once. **Read by the callback instead of the `Buf`**, so
+    // that nothing inside a C callback touches a container.
+    private list: *u8
+    private list_len: usize
+
+    // Offer these application protocols, **most preferred first, and this end's order wins**.
+    //
+    // That is a choice rather than OpenSSL's: the server sees both lists and picks, so it may honour
+    // either preference. A server's own order is the one to prefer, because it is the end that knows
+    // which protocol it serves well.
+    //
+    // **The list is read later, from inside the handshake**, so it is kept on this struct -- which
+    // is why a `Server` is a box and must not be copied.
+    offer(&self, protocols: []const string) -> Result[unit, Error]
+        self.protos = encode(protocols)?
+        self.list = as_ptr(self.protos.view())
+        self.list_len = self.protos.len()
+
+        c.ctx_set_alpn_select_cb(self.ctx, &pick, ptr_cast(&*self))
+
+        Ok(())
+    end offer
+end Server
+
+// Choose a protocol, from inside the handshake.
+//
+// **`arg` is the `Server`'s own address**, which is how a C callback with no other way home finds
+// its sysl value -- the same shape `sh.sysl.llhttp` uses, minus the offsetting, because OpenSSL has
+// a user pointer to carry it.
+//
+// **What is written back must outlive the call**, so it points into the server's own list rather
+// than at anything built here.
+private pick(ssl: *c.Ssl, out: **u8, outlen: *u8, offered: *u8, offered_len: u32, arg: *u8) -> i32
+    val sv: *Server = ptr_cast(arg)
+
+    if sv.list_len == 0 || offered_len == 0 then return c.SSL_TLSEXT_ERR_NOACK
+
+    val ours = sv.list[0..<sv.list_len]
+    val theirs = offered[0..<usize(offered_len)]
+
+    var i: usize = 0
+
+    while i + 1 <= ours.len
+        val n = usize(ours[i])
+
+        if n == 0 || i + 1 + n > ours.len then break
+
+        var j: usize = 0
+
+        while j + 1 <= theirs.len
+            val m = usize(theirs[j])
+
+            if m == 0 || j + 1 + m > theirs.len then break
+
+            if m == n && ours[(i + 1)..<(i + 1 + n)] == theirs[(j + 1)..<(j + 1 + m)]
+                *out = ptr_cast(usize(sv.list) + i + 1)
+                *outlen = u8(n)
+
+                return c.SSL_TLSEXT_ERR_OK
+
+            j += 1 + m
+
+        i += 1 + n
+
+    // **Refusing is right when both ends named protocols and none matched**, which is what RFC 7301
+    // asks for: carrying on would leave the peer to guess what it is speaking to.
+    c.SSL_TLSEXT_ERR_ALERT_FATAL
+end pick
+
+impl Drop for Server
+    drop(self) = c.ctx_free(self.ctx)
+
+// A TLS server presenting a certificate.
+//
+// **Both arguments are PEM bytes, not file names, and that is the package's shape rather than an
+// oversight.** OpenSSL is never given the socket here; giving it the filesystem instead would be the
+// same leak wearing a different hat. Bytes may have come from a file, a secret store, an environment
+// variable or a test's own string, and this neither knows nor asks.
+//
+// **The certificate may be a chain, leaf first**, which is what a public certificate authority hands
+// out and what a peer needs in order to build a path. Everything after the first is added as an
+// intermediate.
+//
+// **TLS 1.2 is the floor**, as it is for a client.
+server(certificate: []const u8, key: []const u8) -> Result[&Server, Error]
+    c.err_clear_error()
+
+    val ctx = c.ctx_new(c.tls_server_method())
+
+    if ctx == null then return Err(fail(c.SSL_ERROR_SSL, "could not make a TLS context"))
+
+    val made = Server(ctx, buf(), ptr_cast(0usize), 0)
+
+    present(ctx, certificate)?
+    unlock(ctx, key)?
+
+    // **A key that does not go with the certificate is caught nowhere else.** Both calls above
+    // succeed on a mismatched pair, and the handshake then fails at the *peer* with a decrypt error
+    // that says nothing about this end at all.
+    if c.ctx_check_private_key(ctx) != 1
+        return Err(fail(c.SSL_ERROR_SSL, "the private key does not go with the certificate"))
+
+    c.ctx_ctrl(ctx, c.SSL_CTRL_SET_MIN_PROTO_VERSION, i64(c.TLS1_2_VERSION), null)
+
+    Ok(made)
+end server
+
+// Read the certificate chain and install it.
+private present(ctx: *c.SslCtx, pem: []const u8) -> Result[unit, Error]
+    if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "the certificate is empty"))
+
+    val bio = c.bio_new_mem_buf(as_ptr(pem), i32(pem.len))
+
+    if bio == null then return Err(fail(c.SSL_ERROR_SSL, "could not read the certificate"))
+
+    var found: usize = 0
+    var trouble: Option[Error] = None
+
+    loop
+        // **Null means the end of the buffer as well as a bad object**, so the count below is what
+        // separates "no certificates at all" from "three of them".
+        val x = c.pem_read_bio_x509(bio, null, null, null)
+
+        if x == null then break
+
+        // The first is the leaf this end presents; the rest are the path to it. **`add1` takes a
+        // reference of its own**, as `use_certificate` does, so both are followed by the free.
+        val rc = if found == 0
+            c.ctx_use_certificate(ctx, x)
+        else
+            i32(c.ctx_ctrl(ctx, c.SSL_CTRL_CHAIN_CERT, 1, ptr_cast(x)))
+
+        c.x509_free(x)
+
+        if rc != 1
+            trouble = Some(fail(c.SSL_ERROR_SSL, "the certificate was refused"))
+            break
+
+        found += 1
+    end loop
+
+    c.bio_free(bio)
+
+    trouble match
+        Some(e) -> return Err(e)
+        None -> ()
+
+    if found == 0 then return Err(fail(c.SSL_ERROR_SSL, "there was no certificate in those bytes"))
+
+    Ok(())
+end present
+
+// Read the private key and install it.
+private unlock(ctx: *c.SslCtx, pem: []const u8) -> Result[unit, Error]
+    if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "the private key is empty"))
+
+    val bio = c.bio_new_mem_buf(as_ptr(pem), i32(pem.len))
+
+    if bio == null then return Err(fail(c.SSL_ERROR_SSL, "could not read the private key"))
+
+    // **Null for the passphrase callback means OpenSSL prompts on a terminal**, which a server has
+    // no business doing -- so an encrypted key is refused here rather than hanging a process. The
+    // fourth argument being null is what makes the default callback read an empty passphrase and
+    // fail, instead of asking.
+    val key = c.pem_read_bio_private_key(bio, null, null, null)
+
+    c.bio_free(bio)
+
+    if key == null
+        return Err(fail(c.SSL_ERROR_SSL, "there was no private key in those bytes, or it is encrypted"))
+
+    val rc = c.ctx_use_private_key(ctx, key)
+
+    c.pkey_free(key)
+
+    if rc != 1 then return Err(fail(c.SSL_ERROR_SSL, "the private key was refused"))
+
+    Ok(())
+end unlock
+
+// Take a session from a peer that is connecting.
+//
+// **`connect` with one call changed.** Nothing else about a `Stream` differs between the two ends --
+// the memory buffers, the handshake, the reads and the writes are the same object -- which is what
+// the memory-BIO shape buys and the reason this package did not have to grow a second one.
+//
+// **No host name and no verification.** A server presents a certificate rather than checking one,
+// and asking a client for one is a different feature this package does not offer.
+accept(of: &Server) -> Result[&Stream, Error]
+    c.err_clear_error()
+
+    val ssl = c.ssl_new(of.ctx)
+
+    if ssl == null then return Err(fail(c.SSL_ERROR_SSL, "could not begin a TLS session"))
+
+    val rbio = c.bio_new(c.bio_s_mem())
+    val wbio = c.bio_new(c.bio_s_mem())
+
+    if rbio == null || wbio == null
+        c.ssl_free(ssl)
+
+        return Err(fail(c.SSL_ERROR_SSL, "could not make the buffers a TLS session is driven through"))
+    end if
+
+    // From here on the buffers belong to `ssl`, so every way out frees only that.
+    c.ssl_set_bio(ssl, rbio, wbio)
+    c.ssl_set_accept_state(ssl)
+
+    Ok(Stream(ssl, rbio, wbio, Under.AsServer(of)))
+end accept
