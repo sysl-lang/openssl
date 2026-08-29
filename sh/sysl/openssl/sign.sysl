@@ -1,0 +1,390 @@
+// Signing and verifying, in the shapes JOSE asks for.
+//
+// **This is the crypto, not a JWT library.** A token is three base64url pieces, a JSON header and a
+// set of claims to check against a clock -- none of which is OpenSSL's, and all of which sysl can
+// already do. What could not be done anywhere in the org before this file is the middle step:
+// deciding whether a signature over `header.payload` was made by the key a JWKS document names. So
+// what is here is a key, an algorithm, and the two directions.
+//
+// **`monocypher` has Ed25519 and nobody issues EdDSA tokens.** Real ones are RS256 and ES256 --
+// RSASSA-PKCS1-v1_5 and ECDSA over P-256 -- which is why this is OpenSSL's job rather than a pure
+// sysl one.
+//
+// **An ECDSA signature has two representations and JOSE uses the one OpenSSL does not.** RFC 7518
+// carries it as the two coordinates concatenated, `r || s`, each padded to the curve's width;
+// `EVP_DigestVerify` wants the DER `ECDSA-Sig-Value` that every other ECDSA interface in the world
+// uses. Converting between them is this file's job and it is the one thing here that must not be
+// skipped: a binding that hands the raw form straight to OpenSSL **verifies nothing and reports
+// success**, because the DER parse fails and a failed parse and a bad signature come back as the
+// same zero.
+
+module sh.sysl.openssl
+
+import sh.sysl.openssl.c
+import sysl.slices.as_ptr
+import sysl.buf.{Buf, buf}
+
+// The algorithms a token names.
+//
+// **The `alg` header is not to be trusted and this is why the algorithm is an argument.** A verifier
+// that read the algorithm out of the token it is checking accepts whatever an attacker wrote there,
+// which is how `alg: none` and the RS256-key-as-an-HMAC-secret confusion both work. The caller says
+// what it expects; the token gets no vote.
+enum Algorithm
+    Rs256
+    Rs384
+    Rs512
+    Ps256
+    Ps384
+    Ps512
+    Es256
+    Es384
+    Es512
+end Algorithm
+
+// -- keys -------------------------------------------------------------------------------------------
+
+// A key that can check a signature.
+struct PublicKey
+    private key: *c.EvpPkey
+end PublicKey
+
+impl Drop for PublicKey
+    drop(self) = c.pkey_free(self.key)
+
+// A key that can make one.
+struct PrivateKey
+    private key: *c.EvpPkey
+end PrivateKey
+
+impl Drop for PrivateKey
+    drop(self) = c.pkey_free(self.key)
+
+// Read a public key from PEM -- a `BEGIN PUBLIC KEY` block, which is SubjectPublicKeyInfo.
+//
+// **Not a certificate.** A certificate carries a public key inside it and is a different object;
+// this reads the key on its own, which is what a JWKS endpoint's PEM form and an `openssl pkey -pubout`
+// both produce.
+public_key(pem: []const u8) -> Result[&PublicKey, Error]
+    read(pem, true) match
+        Ok(k) -> Ok(PublicKey(k))
+        Err(e) -> Err(e)
+end public_key
+
+// Read a private key from PEM -- a `BEGIN PRIVATE KEY` block.
+//
+// **An encrypted key is refused rather than prompted for.** The passphrase callback is left null,
+// which makes OpenSSL try an empty one and fail, instead of reading a terminal a server has no
+// business touching.
+private_key(pem: []const u8) -> Result[&PrivateKey, Error]
+    read(pem, false) match
+        Ok(k) -> Ok(PrivateKey(k))
+        Err(e) -> Err(e)
+end private_key
+
+private read(pem: []const u8, public: bool) -> Result[*c.EvpPkey, Error]
+    if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "there was no key in those bytes"))
+
+    c.err_clear_error()
+
+    val bio = c.bio_new_mem_buf(as_ptr(pem), i32(pem.len))
+
+    if bio == null then return Err(fail(c.SSL_ERROR_SSL, "could not read the key"))
+
+    val key = if public
+        c.pem_read_bio_pubkey(bio, null, null, null)
+    else
+        c.pem_read_bio_private_key(bio, null, null, null)
+
+    c.bio_free(bio)
+
+    if key == null then return Err(fail(c.SSL_ERROR_SSL, "there was no key in those bytes"))
+
+    Ok(key)
+end read
+
+// -- what each algorithm is -------------------------------------------------------------------------
+
+private digest_of(alg: Algorithm) -> *c.EvpMd = alg match
+    Rs256 -> c.sha256()
+    Ps256 -> c.sha256()
+    Es256 -> c.sha256()
+    Rs384 -> c.sha384()
+    Ps384 -> c.sha384()
+    Es384 -> c.sha384()
+    Rs512 -> c.sha512()
+    Ps512 -> c.sha512()
+    Es512 -> c.sha512()
+
+// Half the width of an ECDSA signature, in bytes -- and zero for the RSA algorithms, which have no
+// coordinates and no conversion to do.
+//
+// **`Es512` is 66 and not 64**, because P-521's order is 521 bits: the one place where the name of a
+// JOSE algorithm is the digest's width and not the curve's.
+private coordinate_of(alg: Algorithm) -> usize = alg match
+    Es256 -> 32
+    Es384 -> 48
+    Es512 -> 66
+    else 0
+
+private pss_of(alg: Algorithm) -> bool = alg match
+    Ps256 -> true
+    Ps384 -> true
+    Ps512 -> true
+    else false
+
+private name_of(alg: Algorithm) -> string = alg match
+    Rs256 -> "RS256"
+    Rs384 -> "RS384"
+    Rs512 -> "RS512"
+    Ps256 -> "PS256"
+    Ps384 -> "PS384"
+    Ps512 -> "PS512"
+    Es256 -> "ES256"
+    Es384 -> "ES384"
+    Es512 -> "ES512"
+
+// Whether this key is the kind the algorithm is about.
+//
+// **A category error a caller makes by wiring the wrong JWKS entry to it**, and one worth refusing
+// loudly: an RSA key handed an ES256 signature would otherwise fail as though the signature were
+// forged, which sends whoever is reading the log somewhere else entirely.
+private suits(key: *c.EvpPkey, alg: Algorithm) -> Result[unit, Error]
+    val id = c.pkey_base_id(key)
+    val wanted = if coordinate_of(alg) != 0 then c.EVP_PKEY_EC else c.EVP_PKEY_RSA
+
+    // A key generated as RSASSA-PSS is a family of its own and signs PSS only.
+    if wanted == c.EVP_PKEY_RSA && id == c.EVP_PKEY_RSA_PSS && pss_of(alg) then return Ok(())
+
+    if id != wanted
+        return Err(Error(c.SSL_ERROR_SSL, 0, s"this key is not one ${name_of(alg)} is about"))
+
+    Ok(())
+end suits
+
+// -- the two directions -----------------------------------------------------------------------------
+
+// Whether this key made this signature over this message.
+//
+// **`Ok(false)` is a signature that does not check out, and `Err` is a question that could not be
+// asked** -- a key of the wrong kind, an ECDSA signature of the wrong length, a library failure.
+// Collapsing the two would make a misconfiguration look like an attack.
+//
+// **For an ECDSA algorithm the signature is JOSE's `r || s`**, exactly the 64, 96 or 132 bytes a
+// token carries, not DER.
+verify(key: &PublicKey, alg: Algorithm, message: []const u8, signature: []const u8) -> Result[bool, Error]
+    suits(key.key, alg)?
+
+    val n = coordinate_of(alg)
+
+    var carried: Buf[u8] = buf()
+    var sig: []const u8 = signature
+
+    if n != 0
+        if signature.len != 2 * n
+            return Err(Error(c.SSL_ERROR_SSL, 0,
+                s"an ${name_of(alg)} signature is ${2 * n} bytes and this one is ${signature.len}"))
+
+        carried = der_of(signature, n)
+        sig = carried.view()
+    end if
+
+    if sig.len == 0 then return Ok(false)
+
+    c.err_clear_error()
+
+    val ctx = c.md_ctx_new()
+
+    if ctx == null then return Err(fail(c.SSL_ERROR_SSL, "could not begin a digest"))
+
+    var pctx: *c.EvpPkeyCtx = ptr_cast(0usize)
+    var ready = c.digest_verify_init(ctx, &pctx, digest_of(alg), null, key.key)
+
+    if ready == 1 && pss_of(alg) then ready = padded(pctx)
+
+    var nothing: [1]u8
+    val tbs = if message.len == 0 then &nothing[0] else as_ptr(message)
+
+    val answer = if ready != 1 then -1 else c.digest_verify(ctx, as_ptr(sig), sig.len, tbs, message.len)
+
+    c.md_ctx_free(ctx)
+
+    if ready != 1 then return Err(fail(c.SSL_ERROR_SSL, s"could not prepare a ${name_of(alg)} verification"))
+
+    // **1, 0 and negative are three answers and not two.** Zero is the signature failing; anything
+    // below it is the library, and reporting that as a forgery would be a lie.
+    if answer == 1 then Ok(true)
+    else if answer == 0 then Ok(false)
+    else Err(fail(c.SSL_ERROR_SSL, "the signature could not be checked"))
+end verify
+
+// Sign a message with this key.
+//
+// **For an ECDSA algorithm the answer is JOSE's `r || s`**, ready to base64url, rather than the DER
+// OpenSSL produced.
+//
+// **ECDSA signing is randomised**, so two signatures over one message differ and neither is wrong.
+// A test that compares one against a recorded answer is testing the random number generator.
+sign(key: &PrivateKey, alg: Algorithm, message: []const u8) -> Result[Buf[u8], Error]
+    suits(key.key, alg)?
+
+    c.err_clear_error()
+
+    val ctx = c.md_ctx_new()
+
+    if ctx == null then return Err(fail(c.SSL_ERROR_SSL, "could not begin a digest"))
+
+    var pctx: *c.EvpPkeyCtx = ptr_cast(0usize)
+    var ready = c.digest_sign_init(ctx, &pctx, digest_of(alg), null, key.key)
+
+    if ready == 1 && pss_of(alg) then ready = padded(pctx)
+
+    var nothing: [1]u8
+    val tbs = if message.len == 0 then &nothing[0] else as_ptr(message)
+
+    // **Room enough for RSA-8192, and no allocator asked for.** A key past that is refused rather
+    // than truncated; nothing in JOSE uses one.
+    var room: [1024]u8
+    var wrote: usize = 1024
+
+    // The first call, with a null buffer, asks how much room is needed; the second fills it.
+    if ready == 1 then ready = c.digest_sign(ctx, null, &wrote, tbs, message.len)
+
+    if ready == 1 && wrote > 1024 then ready = 0
+
+    if ready == 1 then ready = c.digest_sign(ctx, &room[0], &wrote, tbs, message.len)
+
+    c.md_ctx_free(ctx)
+
+    if ready != 1 then return Err(fail(c.SSL_ERROR_SSL, s"could not sign with ${name_of(alg)}"))
+
+    val n = coordinate_of(alg)
+
+    if n == 0
+        var out: Buf[u8] = buf()
+
+        out.extend(room[0..<wrote])
+
+        return Ok(out)
+    end if
+
+    raw_of(room[0..<wrote], n) match
+        Some(out) -> Ok(out)
+        None -> Err(Error(c.SSL_ERROR_SSL, 0, s"OpenSSL produced a signature ${name_of(alg)} cannot carry"))
+end sign
+
+// PSS with a salt the length of the digest, which is what JOSE specifies.
+private padded(pctx: *c.EvpPkeyCtx) -> i32
+    if pctx == null then return 0
+
+    if c.pkey_ctx_set_rsa_padding(pctx, c.RSA_PKCS1_PSS_PADDING) <= 0 then return 0
+
+    if c.pkey_ctx_set_rsa_pss_saltlen(pctx, c.RSA_PSS_SALTLEN_DIGEST) <= 0 then return 0
+
+    1
+end padded
+
+// -- the two shapes of an ECDSA signature -------------------------------------------------------------
+
+// `r || s`, each padded to the curve's width, as a DER `ECDSA-Sig-Value`.
+//
+// **A DER integer is signed and a coordinate is not**, which is the whole of the difficulty: a
+// leading zero byte has to come off, and a `0x00` has to go *on* whenever what is left starts with a
+// byte of 128 or more, or the value reads as negative. Both cases turn up in roughly half of all
+// signatures, so a conversion that skips either is wrong most of the time rather than rarely.
+private[openssl] der_of(raw: []const u8, n: usize) -> Buf[u8]
+    val r = der_int(raw[0..<n])
+    val s = der_int(raw[n..<(2 * n)])
+    val body = r.len() + s.len()
+
+    var out: Buf[u8] = buf()
+
+    out.push(0x30)
+
+    // **P-521 is why the long form is here.** Its body runs to 138 bytes, and a length past 127 has
+    // to say how many bytes the length itself takes.
+    if body > 127 then out.push(0x81)
+
+    out.push(u8(body))
+    out.extend(r.view())
+    out.extend(s.view())
+
+    out
+end der_of
+
+private[openssl] der_int(x: []const u8) -> Buf[u8]
+    var i: usize = 0
+
+    // At least one byte survives, so a coordinate that is entirely zero encodes as a zero.
+    while i + 1 < x.len && x[i] == 0
+        i += 1
+
+    val negative = x[i] >= 128
+    val extra: usize = if negative then 1 else 0
+
+    var out: Buf[u8] = buf()
+
+    out.push(0x02)
+    out.push(u8(x.len - i + extra))
+
+    if negative then out.push(0x00)
+
+    out.extend(x[i..<x.len])
+
+    out
+end der_int
+
+// A DER `ECDSA-Sig-Value` back as `r || s`, each padded to `n` bytes.
+//
+// **Refuses anything it does not fully understand.** A signature is not a place to be generous with
+// a malformed encoding: `None` here becomes a reported failure rather than a quiet acceptance.
+private[openssl] raw_of(der: []const u8, n: usize) -> Option[Buf[u8]]
+    if der.len < 2 || der[0] != 0x30 then return None
+
+    var i: usize = 1
+    var body = usize(der[i])
+
+    i += 1
+
+    if body == 0x81
+        if i >= der.len then return None
+
+        body = usize(der[i])
+        i += 1
+    else if body > 127
+        return None
+
+    if i + body != der.len then return None
+
+    var out: Buf[u8] = buf()
+
+    for half in 0..<2
+        if i + 2 > der.len || der[i] != 0x02 then return None
+
+        val width = usize(der[i + 1])
+
+        i += 2
+
+        if width == 0 || i + width > der.len then return None
+
+        var j = i
+
+        while j + 1 < i + width && der[j] == 0
+            j += 1
+
+        val kept = i + width - j
+
+        if kept > n then return None
+
+        for pad in 0..<(n - kept)
+            out.push(0x00)
+
+        out.extend(der[j..<(i + width)])
+
+        i += width
+    end for
+
+    if out.len() != 2 * n then return None
+
+    Some(out)
+end raw_of

@@ -1,0 +1,396 @@
+// What the signing half claims, checked against somebody else's answers.
+//
+// **The strongest tests here are RFC 7515's own worked examples**, and that is deliberate: an
+// implementation checked only against itself agrees with its own mistakes. Appendix A.2 gives an
+// RSA key and the exact RS256 signature over a named input, and A.3 gives a P-256 key and the exact
+// `r || s` -- so a wrong digest, a wrong padding, a wrong key encoding or a wrong ECDSA
+// representation each fail against a number nobody here chose.
+//
+// **A.3's `s` begins with 197, which has its top bit set.** That is the case the DER conversion is
+// about: it needs a `0x00` in front or the value reads as a negative integer and the parse fails --
+// and a failed parse comes back from OpenSSL as the same zero a forged signature does. So a binding
+// that skipped the conversion would report this exact vector as a bad signature, and one that
+// skipped only the padding would report it as bad about half the time.
+
+module sh.sysl.openssl
+@tests
+
+import sh.sysl.openssl.c
+import sysl.harness.*
+import sysl.buf.{Buf, buf}
+import sysl.encoding.{base64_decode, base64_decoded_len}
+
+// -- RFC 7515's fixtures ----------------------------------------------------------------------------
+
+// Appendix A.2's RSA key, as PEM. **Built from the `n`, `e`, `d`, `p`, `q`, `dp`, `dq` and `qi` the
+// RFC prints**, and checked by signing A.2's input with it and getting A.2's signature back.
+private rfc_rsa_public() -> string = raw"""
+    -----BEGIN PUBLIC KEY-----
+    MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAofgWCuLjybRlzo0tZWJj
+    NiuSfb4p4fAkd/wWJcyQoTbji9k0l8W26mPddxHmfHQp+Vaw+4qPCJrcS2mJPMEz
+    P1Pt0Bm4d4QlL+yRT+SFd2lZS+pCgNMsD1W/YpRPEwOWvG6b32690r2jZ47soMZo
+    9wGzjb/7OMg0LOL+bSf63kpaSHSXndS5z5rexMdbBYUsLA9e+KXBdQOS+UTo7WTB
+    EMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6/I5IhlJH7aGhyxX
+    FvUK+DWNmoudF8NAco9/h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXp
+    oQIDAQAB
+    -----END PUBLIC KEY-----
+    """
+
+private rfc_rsa_private() -> string = raw"""
+    -----BEGIN PRIVATE KEY-----
+    MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCh+BYK4uPJtGXO
+    jS1lYmM2K5J9vinh8CR3/BYlzJChNuOL2TSXxbbqY913EeZ8dCn5VrD7io8ImtxL
+    aYk8wTM/U+3QGbh3hCUv7JFP5IV3aVlL6kKA0ywPVb9ilE8TA5a8bpvfbr3SvaNn
+    juygxmj3AbONv/s4yDQs4v5tJ/reSlpIdJed1LnPmt7Ex1sFhSwsD174pcF1A5L5
+    ROjtZMEQxrZHYJqkeDrrnGya11UxMFBji4NmXG9veoKjlnAqH2QbgtPr8jkiGUkf
+    toaHLFcW9Qr4NY2ai50Xw0Byj3+H2JoY2PyrZ62EWQwuz3WTOTY8BwNNb2BvniHg
+    VFbK5emhAgMBAAECggEAEq5xpGnNCivDflJsRQBXHx1hdR1k6Ulwe2JZD50LpXyW
+    PEAeP88vLNO97IjlA7/GQ5sLKMgvfTeXZx9SE+7YwVol2NXOoAJe46sui395IW/G
+    O+pWJ1O0BkTGoVEn2bKVRUCgu+GjBVaYLU6f3l9kJfFNS3E0QbVdxzubSu3Mkqzj
+    kn439X0M/V51gfpRLI9JYanrC4D4qAdGcopV/0ZHHzQlBjudU2QvXt4ehNYTCBr6
+    XCLQUShb1juUO1ZdiYoFaFQT5Tw8bGUl/x/jTj3ccPDVZFD9pIuhLhBOneufuBiB
+    4cS98l2SR/RQyGWSeWjnczT0QU91p1DhOVRuOopznQKBgQDgHMQQ60imZV1URk0K
+    pLttoLhyt3SmqdEf/kgHePDdtzEafpAu+cS191R2JiuoF2yzWXnwFDcqGigp5BNr
+    0AHQfD8/Lk8l1Mk09jxxCfui5nYooNyac8YFjm3vItzVCVDnEd3BbVWG8qf6deqE
+    lMGAg+C2V0L4oNXnP7LZcPAZRwKBgQC5A8R+CZW2MvRTLLHzwZkUXV866cff7tx6
+    kqa0finGG0KgeqlaZPxgCZnFp7AeAcCMtiynVlJ7vMVgePsLq6XtON4tB5kP9jAP
+    rq3rbAOal78eUH5OcED6eNuCV8ixEu1eWcPNCS/l1OW1EnXUEoEHKl54Xrrz2uNw
+    kgMTP1FZ1wKBgAcCn1dwJKufzBWQxWQp1vsM5fggqPN1qGb5y0MAk3g7/Ls5bkUp
+    5u9SN0Ai3Ya6hNnvWJMb7sXQX6U/zyO2M/hTip7tUeh7CXgwo59dkpN75gJLVds2
+    9+DAncu3KXU4f2Fa+7bLNrur53k8KwPOq2bbuTG69QtV7Jr5MR0AHWKNAoGBAIf/
+    evpitUf+4JYbLpvNXWcY052Mpz22aR84mY3nh3F2LF2mjMJDpTg7FmuyPcVw6EcG
+    yoAe9fa65iNqCq+jdw6PVNGo2hxfjSiZ8IIzHdsPXI89//pMjZcQK9r+CCoRjaZj
+    OYiIDktVWZzmevJuv6WywUqd57LE3Zar3dLSIkx1AoGAIYd7DHOhrWvxkwPQsRM2
+    tOgrjbcrfvtQJipd+DlcxyVuuM9sQLdgjVk2oy26F0EmpScGLq2MowX7fhd/QJQ3
+    ydy5cY7YIBi87w93IKLEdfnbJtoOPLUW0ITrJReOgo1cq9SbsxYawBgfp/gh6A56
+    03k2+ZQwVK0JKSHuLFkuQ3U=
+    -----END PRIVATE KEY-----
+    """
+
+// Appendix A.3's P-256 key, from its `x`, `y` and `d`.
+private rfc_ec_public() -> string = raw"""
+    -----BEGIN PUBLIC KEY-----
+    MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEf83OJ3D2xF1Bg8vub9tLe1gHMzV7
+    6e8Tus9uPHvRVEXH8UTNG72bfocs3+257rn0s2ldbqkLJK2KRiMohYjlrQ==
+    -----END PUBLIC KEY-----
+    """
+
+private rfc_ec_private() -> string = raw"""
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgjpsQnnGQmL+YBIff
+    H1136cspYG6+0iY7X1fCE9+E9LKhRANCAAR/zc4ncPbEXUGDy+5v20t7WAczNXvp
+    7xO6z248e9FURcfxRM0bvZt+hyzf7bnuufSzaV1uqQskrYpGIyiFiOWt
+    -----END PRIVATE KEY-----
+    """
+
+// The signing input both examples use: a JOSE header and a payload with a full stop between them.
+private rfc_input_rs() -> string =
+    "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ"
+
+private rfc_input_es() -> string =
+    "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ"
+
+private rfc_rs256_signature() -> string = "cC4hiUPoj9Eetdgtv3hF80EGrhuB__dzERat0XF9g2VtQgr9PJbu3XOiZj5RZmh7AAuHIm4Bh-0Qc_lF5YKt_O8W2Fp5jujGbds9uJdbF9CUAr7t1dnZcAcQjbKBYNX4BAynRFdiuB--f_nZLgrnbyTyWzO75vRK5h6xBArLIARNPvkSjtQBMHlb1L07Qe7K0GarZRmB_eSN9383LcOLn6_dO--xi12jzDwusC-eOkHWEsqtFZESc6BfI7noOPqvhJ1phCnvWh6IeYI2w9QOYEUipUTI8np6LbgGY9Fs98rqVt5AXLIhWkWywlVmtVrBp0igcN_IoypGlUPQGe77Rw"
+
+private rfc_es256_signature() -> string = "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q"
+
+// -- two more curves, so the wider shapes are exercised ------------------------------------------------
+
+private p384_public() -> string = raw"""
+    -----BEGIN PUBLIC KEY-----
+    MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEDdEJeXHnh1sP8WJVR7R1mAZ/QCOf9GsZ
+    9B2BsWZoyNNMs0aU4fgW72tEkbgZHSaCqMBv0XCsemMTTAU2SB59ERMj6/zyy8eY
+    jwgV8G4amjWYmAlqLs7vaIVfR/BaQFkY
+    -----END PUBLIC KEY-----
+    """
+
+private p384_private() -> string = raw"""
+    -----BEGIN PRIVATE KEY-----
+    MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDA7Tnfxxgmz6SGW1CBM
+    EFdzASi8peS0r/28mlZufWZB8rG250bXmHjLvLeG1cDQ5N2hZANiAAQN0Ql5ceeH
+    Ww/xYlVHtHWYBn9AI5/0axn0HYGxZmjI00yzRpTh+Bbva0SRuBkdJoKowG/RcKx6
+    YxNMBTZIHn0REyPr/PLLx5iPCBXwbhqaNZiYCWouzu9ohV9H8FpAWRg=
+    -----END PRIVATE KEY-----
+    """
+
+// **P-521 is here for the DER length.** Its signature body runs to 138 bytes, past the 127 a
+// single-byte length can carry, so it is the only algorithm that takes the long form -- and nothing
+// smaller would ever notice it missing.
+private p521_public() -> string = raw"""
+    -----BEGIN PUBLIC KEY-----
+    MIGbMBAGByqGSM49AgEGBSuBBAAjA4GGAAQBzhb2er4giSRBi7UuLGmqjw8y+Sms
+    Fl80vsmo/mqM2kmg9raX71LVEed0y7yxC8Pi8KqSein/p5htAhaFaK9wHsMAMgJe
+    ij/Ofq73H1AmzJ6kudiBS3RCCJivRfo4HGjqCYBBy7KpP6WDmHPrXqUJNORGisEz
+    +xCYX/RtYE/TQhR0Qws=
+    -----END PUBLIC KEY-----
+    """
+
+private p521_private() -> string = raw"""
+    -----BEGIN PRIVATE KEY-----
+    MIHuAgEAMBAGByqGSM49AgEGBSuBBAAjBIHWMIHTAgEBBEIAkhA1/rEEWaVgwr+y
+    FT/fcVViCX1ujGkzxBTuepmjq/YekTxLwBCCx/jJ3ojSjItPNjufPMpQn5S7eEgG
+    KVMQJI2hgYkDgYYABAHOFvZ6viCJJEGLtS4saaqPDzL5KawWXzS+yaj+aozaSaD2
+    tpfvUtUR53TLvLELw+LwqpJ6Kf+nmG0CFoVor3AewwAyAl6KP85+rvcfUCbMnqS5
+    2IFLdEIImK9F+jgcaOoJgEHLsqk/pYOYc+tepQk05EaKwTP7EJhf9G1gT9NCFHRD
+    Cw==
+    -----END PRIVATE KEY-----
+    """
+
+// base64url, as a token carries it.
+private unbase64(text: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    var room: [1024]u8
+
+    val n = base64_decode(text.bytes, room[0..<1024]).unwrap()
+
+    out.extend(room[0..<n])
+
+    out
+end unbase64
+
+// -- the RFC's own answers ----------------------------------------------------------------------------
+
+@test
+the_rfcs_rs256_signature_checks_out()
+    val key = public_key(rfc_rsa_public().bytes).unwrap()
+    val sig = unbase64(rfc_rs256_signature())
+
+    assert(verify(key, Rs256, rfc_input_rs().bytes, sig.view()).unwrap(),
+        "RFC 7515 A.2's signature did not check out against RFC 7515 A.2's key")
+
+@test
+the_rfcs_es256_signature_checks_out()
+    // **The vector the conversion exists for.** Its `s` starts at 197, so the DER integer needs a
+    // leading zero; hand OpenSSL the raw 64 bytes instead and it reports a bad signature.
+    val key = public_key(rfc_ec_public().bytes).unwrap()
+    val sig = unbase64(rfc_es256_signature())
+
+    assert_eq(sig.len(), 64)
+    assert(sig.at(32) >= 128, "this vector no longer exercises the leading-zero case")
+
+    assert(verify(key, Es256, rfc_input_es().bytes, sig.view()).unwrap(),
+        "RFC 7515 A.3's signature did not check out -- the r||s to DER conversion is wrong")
+
+@test
+signing_rs256_reproduces_the_rfcs_signature_byte_for_byte()
+    // **RSASSA-PKCS1-v1_5 is deterministic**, so there is exactly one right answer and the RFC
+    // prints it. Nothing else in this file can make that claim -- PSS and ECDSA are randomised.
+    val key = private_key(rfc_rsa_private().bytes).unwrap()
+    val made = sign(key, Rs256, rfc_input_rs().bytes).unwrap()
+    val want = unbase64(rfc_rs256_signature())
+
+    assert_eq(made.len(), 256)
+    assert(made == want, "signing RFC 7515 A.2's input produced a different signature")
+
+@test
+an_altered_message_does_not_check_out()
+    val key = public_key(rfc_rsa_public().bytes).unwrap()
+    val sig = unbase64(rfc_rs256_signature())
+
+    var text: Buf[u8] = buf()
+
+    text.extend(rfc_input_rs().bytes)
+    text.set(0, text.at(0) + 1)
+
+    // **`Ok(false)`, not `Err`.** A signature that does not check out is an answer; a question that
+    // could not be asked is a failure, and collapsing them makes a misconfiguration look like an
+    // attack.
+    assert_eq(verify(key, Rs256, text.view(), sig.view()).unwrap(), false)
+
+@test
+an_altered_signature_does_not_check_out()
+    val key = public_key(rfc_rsa_public().bytes).unwrap()
+
+    var sig = unbase64(rfc_rs256_signature())
+
+    sig.set(200, sig.at(200) + 1)
+
+    assert_eq(verify(key, Rs256, rfc_input_rs().bytes, sig.view()).unwrap(), false)
+
+@test
+an_altered_ecdsa_signature_does_not_check_out()
+    val key = public_key(rfc_ec_public().bytes).unwrap()
+
+    var sig = unbase64(rfc_es256_signature())
+
+    // In `s`, so that the DER conversion still runs over a well-formed input.
+    sig.set(60, sig.at(60) + 1)
+
+    assert_eq(verify(key, Es256, rfc_input_es().bytes, sig.view()).unwrap(), false)
+
+// -- round trips ----------------------------------------------------------------------------------------
+
+@test
+every_rsa_algorithm_round_trips()
+    val pub = public_key(rfc_rsa_public().bytes).unwrap()
+    val priv = private_key(rfc_rsa_private().bytes).unwrap()
+    val text = "the quick brown fox".bytes
+
+    for alg in [Algorithm.Rs256, Algorithm.Rs384, Algorithm.Rs512, Algorithm.Ps256, Algorithm.Ps384, Algorithm.Ps512]
+        val sig = sign(priv, alg, text).unwrap()
+
+        assert_eq(sig.len(), 256)
+        assert(verify(pub, alg, text, sig.view()).unwrap(), "a signature this file made did not check out")
+        assert_eq(verify(pub, alg, "something else".bytes, sig.view()).unwrap(), false)
+    end for
+
+@test
+es256_round_trips_often_enough_to_meet_both_padding_cases()
+    // **Thirty-two signatures rather than one, because ECDSA is randomised.** Each coordinate has
+    // its top bit set about half the time, so a single round trip has a one-in-four chance of never
+    // touching the leading-zero path at all -- which is how a conversion that is wrong half the time
+    // passes a suite.
+    val pub = public_key(rfc_ec_public().bytes).unwrap()
+    val priv = private_key(rfc_ec_private().bytes).unwrap()
+    val text = "the quick brown fox".bytes
+
+    var padded = 0
+    var bare = 0
+
+    for round in 0..<32
+        val sig = sign(priv, Es256, text).unwrap()
+
+        assert_eq(sig.len(), 64)
+        assert(verify(pub, Es256, text, sig.view()).unwrap(), "a signature this file made did not check out")
+
+        if sig.at(0) >= 128 || sig.at(32) >= 128 then padded += 1 else bare += 1
+    end for
+
+    // **Both paths were taken**, which is the point of the loop and not a fact about the numbers.
+    assert(padded > 0, "no signature in thirty-two needed a leading zero -- the loop proves nothing")
+    assert(bare > 0, "every signature in thirty-two needed a leading zero -- the loop proves nothing")
+
+@test
+es384_round_trips()
+    val pub = public_key(p384_public().bytes).unwrap()
+    val priv = private_key(p384_private().bytes).unwrap()
+    val text = "the quick brown fox".bytes
+
+    for round in 0..<8
+        val sig = sign(priv, Es384, text).unwrap()
+
+        assert_eq(sig.len(), 96)
+        assert(verify(pub, Es384, text, sig.view()).unwrap())
+
+@test
+es512_round_trips_through_the_long_form_der_length()
+    val pub = public_key(p521_public().bytes).unwrap()
+    val priv = private_key(p521_private().bytes).unwrap()
+    val text = "the quick brown fox".bytes
+
+    for round in 0..<8
+        val sig = sign(priv, Es512, text).unwrap()
+
+        // **66 bytes a coordinate, not 64** -- P-521's order is 521 bits, and this is the one JOSE
+        // name whose number is the digest's width rather than the curve's.
+        assert_eq(sig.len(), 132)
+        assert(verify(pub, Es512, text, sig.view()).unwrap())
+
+@test
+an_empty_message_can_be_signed_and_checked()
+    val pub = public_key(rfc_rsa_public().bytes).unwrap()
+    val priv = private_key(rfc_rsa_private().bytes).unwrap()
+
+    var none: [0]u8
+
+    val sig = sign(priv, Rs256, none[0..<0]).unwrap()
+
+    assert(verify(pub, Rs256, none[0..<0], sig.view()).unwrap())
+
+// -- what is refused --------------------------------------------------------------------------------
+
+@test
+a_key_of_the_wrong_kind_is_refused_rather_than_reported_as_a_forgery()
+    // **A category error a caller makes by wiring the wrong JWKS entry to an algorithm.** Reported
+    // as `Ok(false)` it would read as an attack and send whoever is on call somewhere else.
+    val rsa = public_key(rfc_rsa_public().bytes).unwrap()
+    val ec = public_key(rfc_ec_public().bytes).unwrap()
+    val sig = unbase64(rfc_es256_signature())
+
+    assert(verify(rsa, Es256, rfc_input_es().bytes, sig.view()).is_err())
+    assert(verify(ec, Rs256, rfc_input_rs().bytes, sig.view()).is_err())
+
+@test
+an_ecdsa_signature_of_the_wrong_length_is_refused()
+    val key = public_key(rfc_ec_public().bytes).unwrap()
+    val sig = unbase64(rfc_es256_signature())
+
+    // A DER signature handed in where JOSE's raw form belongs is the mistake this catches.
+    val wrong = verify(key, Es256, rfc_input_es().bytes, sig.view()[0..<63])
+
+    assert(wrong.is_err(), "a 63-byte ES256 signature was accepted as a question worth asking")
+    assert(wrong.unwrap_err().message.len > 12)
+
+@test
+bytes_that_are_not_a_key_are_refused()
+    assert(public_key("not a key".bytes).is_err())
+    assert(private_key("not a key".bytes).is_err())
+
+    var none: [0]u8
+
+    assert(public_key(none[0..<0]).is_err())
+
+@test
+a_public_key_is_not_a_private_one()
+    assert(private_key(rfc_rsa_public().bytes).is_err(), "a public key was read as a private one")
+
+// -- the conversion, on its own -----------------------------------------------------------------------
+
+@test
+a_coordinate_whose_top_bit_is_set_gains_a_leading_zero()
+    var high: [32]u8
+
+    high[0] = 200
+
+    val der = der_int(high[0..<32])
+
+    // tag, length, the pad, and the coordinate.
+    assert_eq(der.len(), 35)
+    assert_eq(der.at(0), u8(0x02))
+    assert_eq(der.at(1), u8(33))
+    assert_eq(der.at(2), u8(0))
+    assert_eq(der.at(3), u8(200))
+
+@test
+a_coordinate_with_leading_zeros_loses_them_and_gets_them_back()
+    var small: [32]u8
+
+    small[31] = 7
+
+    val der = der_int(small[0..<32])
+
+    assert_eq(der.len(), 3)
+    assert_eq(der.at(2), u8(7))
+
+    // A coordinate of nothing but zeros still encodes as one byte, which is what DER asks for.
+    var zero: [32]u8
+
+    assert_eq(der_int(zero[0..<32]).len(), 3)
+
+@test
+the_two_representations_round_trip()
+    var raw: [64]u8
+
+    raw[0] = 0
+    raw[1] = 200
+    raw[32] = 255
+    raw[63] = 1
+
+    val der = der_of(raw[0..<64], 32)
+    val back = raw_of(der.view(), 32).unwrap()
+
+    assert(back.view() == raw[0..<64], "a signature did not survive the trip to DER and back")
+
+@test
+der_that_is_not_an_ecdsa_signature_is_refused()
+    var junk: [8]u8
+
+    junk[0] = 0x31
+
+    assert(raw_of(junk[0..<8], 32).is_none())
+    assert(raw_of(junk[0..<0], 32).is_none())
+
+    // A well-formed sequence whose contents are too wide for the curve.
+    val wide = der_of("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".bytes, 48)
+
+    assert(raw_of(wide.view(), 32).is_none(), "a P-384 signature was read as a P-256 one")

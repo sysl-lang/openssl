@@ -1,13 +1,13 @@
-// OpenSSL — a TLS client for sysl, bound over memory BIOs.
+// OpenSSL — TLS for sysl at both ends, bound over memory BIOs, plus signing.
 //
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       openssl { git = "github.com/sysl-lang/openssl", version = "0.1.0" }
+//       openssl { git = "github.com/sysl-lang/openssl", version = "0.2.0" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
-// tag `v0.1.0` on this repository.
+// tag `v0.2.0` on this repository.
 //
 // **OpenSSL has to be installed, and so do its headers.** Nothing is vendored: OpenSSL is a very
 // large C project with its own build system, and a package carrying it would be carrying a port.
@@ -21,11 +21,11 @@
 
 package {
   name    = "openssl"
-  version = "0.1.0"
+  version = "0.2.0"
 
   // The compiler this was written against and the only one it is known to build with. Lower it when
   // somebody builds this with an older one — a floor is meant to be a fact rather than a guess.
-  sysl = "0.0.87"
+  sysl = "0.0.90"
 }
 
 // **`posix`, because TLS is only half of what this is for and the other half is a socket.** The

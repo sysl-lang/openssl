@@ -1,4 +1,4 @@
-// TLS for sysl, as a byte-stream transformer.
+// TLS for sysl at both ends, as a byte-stream transformer.
 //
 // **OpenSSL is never given the socket.** It is given a pair of in-memory buffers: ciphertext the
 // program received goes in one end, plaintext comes out; plaintext the program wants to send goes
@@ -11,6 +11,9 @@
 // inside it. Here it means one binding serves a blocking fetch, a libuv connection and a test with
 // no socket at all -- and the test is not a lesser case, because the whole protocol can be driven
 // between two `Stream`s in memory.
+//
+// **It is also why a server cost almost nothing.** A `Stream` never asks which end it is, so
+// `accept` is `connect` with one call changed and the connection tier below is shared entire.
 //
 // The loop a caller writes is three steps, **and the order is not free**:
 //
