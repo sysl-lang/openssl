@@ -2,6 +2,8 @@
 
 TLS for sysl — both ends — bound over OpenSSL's memory BIOs, plus the digest signing a token needs.
 
+*An independent sysl package for OpenSSL. It is not affiliated with or endorsed by OpenSSL's authors or trademark holders.*
+
 ```
 dependencies {
   openssl { git = "github.com/sysl-lang/openssl", version = "0.2.0" }
