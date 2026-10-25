@@ -22,6 +22,7 @@ module sh.sysl.openssl
 
 import sh.sysl.openssl.c
 import sysl.slices.as_ptr
+import sysl.raw.ptr_cast
 import sysl.buf.{Buf, buf}
 
 // The algorithms a token names.

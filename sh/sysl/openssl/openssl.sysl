@@ -38,6 +38,7 @@ module sh.sysl.openssl
 import sh.sysl.openssl.c
 import sysl.text.{cstring, from_cstring, from_utf8_unchecked}
 import sysl.slices.as_ptr
+import sysl.raw.ptr_cast
 import sysl.buf.{Buf, buf}
 
 // What went wrong, in OpenSSL's own words where it has any.
