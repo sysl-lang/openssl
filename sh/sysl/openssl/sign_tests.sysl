@@ -166,7 +166,7 @@ the_rfcs_es256_signature_checks_out()
     val sig = unbase64(rfc_es256_signature())
 
     assert_eq(sig.len(), 64)
-    assert(sig.at(32) >= 128, "this vector no longer exercises the leading-zero case")
+    assert(sig[32] >= 128, "this vector no longer exercises the leading-zero case")
 
     assert(verify(key, Es256, rfc_input_es().bytes, sig.view()).unwrap(),
         "RFC 7515 A.3's signature did not check out -- the r||s to DER conversion is wrong")
@@ -190,7 +190,7 @@ an_altered_message_does_not_check_out()
     var text: Buf[u8] = buf()
 
     text.extend(rfc_input_rs().bytes)
-    text.set(0, text.at(0) + 1)
+    text[0] = text[0] + 1
 
     // **`Ok(false)`, not `Err`.** A signature that does not check out is an answer; a question that
     // could not be asked is a failure, and collapsing them makes a misconfiguration look like an
@@ -203,7 +203,7 @@ an_altered_signature_does_not_check_out()
 
     var sig = unbase64(rfc_rs256_signature())
 
-    sig.set(200, sig.at(200) + 1)
+    sig[200] = sig[200] + 1
 
     assert_eq(verify(key, Rs256, rfc_input_rs().bytes, sig.view()).unwrap(), false)
 
@@ -214,7 +214,7 @@ an_altered_ecdsa_signature_does_not_check_out()
     var sig = unbase64(rfc_es256_signature())
 
     // In `s`, so that the DER conversion still runs over a well-formed input.
-    sig.set(60, sig.at(60) + 1)
+    sig[60] = sig[60] + 1
 
     assert_eq(verify(key, Es256, rfc_input_es().bytes, sig.view()).unwrap(), false)
 
@@ -253,7 +253,7 @@ es256_round_trips_often_enough_to_meet_both_padding_cases()
         assert_eq(sig.len(), 64)
         assert(verify(pub, Es256, text, sig.view()).unwrap(), "a signature this file made did not check out")
 
-        if sig.at(0) >= 128 || sig.at(32) >= 128 then padded += 1 else bare += 1
+        if sig[0] >= 128 || sig[32] >= 128 then padded += 1 else bare += 1
     end for
 
     // **Both paths were taken**, which is the point of the loop and not a fact about the numbers.
@@ -346,10 +346,10 @@ a_coordinate_whose_top_bit_is_set_gains_a_leading_zero()
 
     // tag, length, the pad, and the coordinate.
     assert_eq(der.len(), 35)
-    assert_eq(der.at(0), u8(0x02))
-    assert_eq(der.at(1), u8(33))
-    assert_eq(der.at(2), u8(0))
-    assert_eq(der.at(3), u8(200))
+    assert_eq(der[0], u8(0x02))
+    assert_eq(der[1], u8(33))
+    assert_eq(der[2], u8(0))
+    assert_eq(der[3], u8(200))
 
 @test
 a_coordinate_with_leading_zeros_loses_them_and_gets_them_back()
@@ -360,7 +360,7 @@ a_coordinate_with_leading_zeros_loses_them_and_gets_them_back()
     val der = der_int(small[0..<32])
 
     assert_eq(der.len(), 3)
-    assert_eq(der.at(2), u8(7))
+    assert_eq(der[2], u8(7))
 
     // A coordinate of nothing but zeros still encodes as one byte, which is what DER asks for.
     var zero: [32]u8

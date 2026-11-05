@@ -6,7 +6,7 @@ TLS for sysl — both ends — bound over OpenSSL's memory BIOs, plus the digest
 
 ```
 dependencies {
-  openssl { git = "github.com/sysl-lang/openssl", version = "0.2.1" }
+  openssl { git = "github.com/sysl-lang/openssl", version = "0.2.2" }
 }
 ```
 
