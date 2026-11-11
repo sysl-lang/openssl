@@ -125,6 +125,13 @@ a_trusted_certificate_for_another_host_is_a_host_mismatch()
     assert(e.message.contains("hostname mismatch"), e.message)
 
 @test
+a_trusted_certificate_reached_by_another_ip_address_is_a_host_mismatch()
+    val e = refused(certificate(), certificate(), "127.0.0.2")
+
+    assert_eq(e.verify, c.X509_V_ERR_IP_ADDRESS_MISMATCH)
+    assert_eq(named(e), "host")
+
+@test
 a_certificate_nobody_trusts_is_untrusted()
     val e = refused(certificate(), "", "localhost")
 
@@ -201,6 +208,8 @@ every_verdict_maps_to_the_refusal_a_caller_acts_on()
     // `X509_V_ERR_*` values, written out because the constants under test are what they check.
     assert_eq(named(Error(1, 0, "", 0)), "none")
     assert_eq(named(Error(1, 0, "", 62)), "host")
+    assert_eq(named(Error(1, 0, "", 64)), "host")
+    assert_eq(named(Error(1, 0, "", 63)), "other 63")
     assert_eq(named(Error(1, 0, "", 10)), "expired")
     assert_eq(named(Error(1, 0, "", 9)), "early")
     assert_eq(named(Error(1, 0, "", 2)), "untrusted")

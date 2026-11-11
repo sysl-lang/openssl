@@ -65,7 +65,8 @@ struct Error
 
         // The names are OpenSSL's `X509_V_ERR_*`, and the grouping is the decision: what a caller
         // acts on is "the name is wrong", "the dates are wrong" or "I do not trust the issuer".
-        if self.verify == c.X509_V_ERR_HOSTNAME_MISMATCH then return Some(Refusal.HostMismatch)
+        // A host is named by a DNS name or by an IP address, and either one not matching is the same refusal.
+        if self.verify == c.X509_V_ERR_HOSTNAME_MISMATCH || self.verify == c.X509_V_ERR_IP_ADDRESS_MISMATCH then return Some(Refusal.HostMismatch)
         if self.verify == c.X509_V_ERR_CERT_HAS_EXPIRED then return Some(Refusal.Expired)
         if self.verify == c.X509_V_ERR_CERT_NOT_YET_VALID then return Some(Refusal.NotYetValid)
 
@@ -86,7 +87,7 @@ end Error
 // **`Other` carries OpenSSL's own number**, because the verdicts are several dozen and a caller that
 // needs a rarer one (a revoked certificate, a path too long) can still read it.
 enum Refusal
-    // The chain is fine and the certificate names some other host (62).
+    // The chain is fine and the certificate names some other host: a DNS name (62) or an IP address (64).
     HostMismatch
 
     // notAfter is in the past (10).
