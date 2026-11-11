@@ -6,7 +6,7 @@ TLS for sysl — both ends — bound over OpenSSL's memory BIOs, plus the digest
 
 ```
 dependencies {
-  openssl { git = "github.com/sysl-lang/openssl", version = "0.2.2" }
+  openssl { git = "github.com/sysl-lang/openssl", version = "0.2.3" }
 }
 ```
 
@@ -61,6 +61,22 @@ network fault. It cost this package's own first live handshake, and there is a t
 **There is no way to relax any of it**, and that is deliberate: a verify callback is how a program
 overrides OpenSSL's decision, and a package offering one would be offering a way to accept a bad
 certificate. If you need that, this is the wrong package.
+
+**A refused certificate says why.** A failed handshake carries `Error.verify`, OpenSSL's X509 verdict
+(`0` when the failure was not a certificate refusal), and the message ends with OpenSSL's words for
+it. `error.refusal()` turns it into something to `match` on, because a wrong host name and an
+untrusted issuer fail with the identical "certificate verify failed" code:
+
+```
+handshake() match
+    Err(e) -> e.refusal() match
+        Some(HostMismatch) -> ...        // trusted chain, different host (62)
+        Some(Expired) -> ...             // notAfter is past (10)
+        Some(NotYetValid) -> ...         // notBefore is ahead, usually a wrong clock (9)
+        Some(Untrusted) -> ...           // unknown issuer or self-signed (2, 18, 19, 20, 21)
+        Some(Other(code)) -> ...         // any other X509_V_ERR_* number
+        None -> ...                      // not a certificate refusal
+```
 
 `client.trust(pem)` is the one thing that moves, and it moves **upward**: it adds a certificate
 authority to what is already trusted. A private root, a corporate one, or the self-signed

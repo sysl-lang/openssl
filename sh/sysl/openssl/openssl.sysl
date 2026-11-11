@@ -47,11 +47,59 @@ import sysl.buf.{Buf, buf}
 // `SSL_get_error`'s verdict on the call -- the protocol closed, the syscall failed, the library
 // objected -- and `code` is the top of OpenSSL's own error queue, which is what carries "certificate
 // has expired". A failure can have the first and not the second.
+//
+// **`verify` is the third, and it is what tells two refusals apart that read identically in `code`.**
+// A certificate that does not match the host and a certificate nobody trusts both fail a handshake
+// with "certificate verify failed"; the X509 verdict is the only place the difference lives. It is
+// zero (`X509_V_OK`) for every failure that is not the certificate being refused.
 struct Error
     reason: i32
     code: u64
     message: string
+    verify: i64
+
+    // Why a certificate was refused, as something a caller can `match` on, or `None` when this
+    // failure was not a certificate refusal.
+    refusal(self) -> Option[Refusal]
+        if self.verify == c.X509_V_OK then return None
+
+        // The names are OpenSSL's `X509_V_ERR_*`, and the grouping is the decision: what a caller
+        // acts on is "the name is wrong", "the dates are wrong" or "I do not trust the issuer".
+        if self.verify == c.X509_V_ERR_HOSTNAME_MISMATCH then return Some(Refusal.HostMismatch)
+        if self.verify == c.X509_V_ERR_CERT_HAS_EXPIRED then return Some(Refusal.Expired)
+        if self.verify == c.X509_V_ERR_CERT_NOT_YET_VALID then return Some(Refusal.NotYetValid)
+
+        // Every way the chain fails to reach a root that is trusted: no issuer anywhere (2, 20), a
+        // leaf signature nothing vouches for (21), and a self-signed certificate that is the leaf (18)
+        // or sits inside the chain (19).
+        val v = self.verify
+        val untrusted = v == c.X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT || v == c.X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY || v == c.X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE || v == c.X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT || v == c.X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN
+
+        if untrusted then return Some(Refusal.Untrusted)
+
+        Some(Refusal.Other(self.verify))
+    end refusal
 end Error
+
+// Why a certificate was refused.
+//
+// **`Other` carries OpenSSL's own number**, because the verdicts are several dozen and a caller that
+// needs a rarer one (a revoked certificate, a path too long) can still read it.
+enum Refusal
+    // The chain is fine and the certificate names some other host (62).
+    HostMismatch
+
+    // notAfter is in the past (10).
+    Expired
+
+    // notBefore is in the future (9) -- usually a clock that is wrong rather than a certificate.
+    NotYetValid
+
+    // The chain does not end at a root this client trusts (2, 18, 19, 20, 21).
+    Untrusted
+
+    Other(code: i64)
+end Refusal
 
 impl Display for Error
     display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message, out, fmt)
@@ -59,16 +107,35 @@ impl Display for Error
 private[openssl] fail(reason: i32, what: string) -> Error
     val code = c.err_get_error()
 
-    if code == 0 then return Error(reason, 0, what)
+    if code == 0 then return Error(reason, 0, what, 0)
 
     var buf: [256]u8
 
     c.err_error_string_n(code, &buf[0], 256)
 
     from_cstring(&buf[0]) match
-        Ok(text) -> Error(reason, code, s"${what}: ${text}")
-        Err(_) -> Error(reason, code, what)
+        Ok(text) -> Error(reason, code, s"${what}: ${text}", 0)
+        Err(_) -> Error(reason, code, what, 0)
 end fail
+
+// The same, for a connection whose certificate check may be what failed.
+//
+// **The verdict is read after the failure and not before it, because that is when it is set** --
+// OpenSSL records it on the connection as the chain is walked and leaves it there when the
+// handshake aborts. It is also read for any failure rather than only a "certificate verify failed"
+// one: it is `X509_V_OK` when nothing was refused, so a failure of another kind carries zero.
+private[openssl] fail_checking(ssl: *c.Ssl, reason: i32, what: string) -> Error
+    val failed = fail(reason, what)
+    val verdict = c.ssl_get_verify_result(ssl)
+
+    if verdict == c.X509_V_OK then return failed
+
+    val text = c.x509_verify_cert_error_string(verdict)
+
+    from_cstring(text) match
+        Ok(why) -> Error(failed.reason, failed.code, s"${failed.message} (${why})", verdict)
+        Err(_) -> Error(failed.reason, failed.code, failed.message, verdict)
+end fail_checking
 
 // How far a call got.
 //
@@ -112,7 +179,7 @@ struct Client
     // a corporate root, or the self-signed certificate a test stands up are all the same case: more
     // is trusted, never less. The PEM may hold several, and every one of them is added.
     trust(&self, pem: []const u8) -> Result[unit, Error]
-        if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "there was nothing to trust"))
+        if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "there was nothing to trust", 0))
 
         val store = c.ctx_get_cert_store(self.ctx)
 
@@ -279,7 +346,7 @@ struct Stream
         val verdict = c.ssl_get_verify_result(self.ssl)
 
         if verdict != c.X509_V_OK
-            return Err(Error(c.SSL_ERROR_SSL, u64(verdict), s"the server's certificate was not acceptable (X509 code ${verdict})"))
+            return Err(Error(c.SSL_ERROR_SSL, u64(verdict), s"the server's certificate was not acceptable (X509 code ${verdict})", verdict))
 
         Ok(Step.Done)
     end checked
@@ -354,7 +421,7 @@ struct Stream
         if reason == c.SSL_ERROR_SYSCALL
             return Err(fail(reason, "the connection under TLS failed"))
 
-        Err(fail(reason, "TLS failed"))
+        Err(fail_checking(self.ssl, reason, "TLS failed"))
     end step_of
 end Stream
 
@@ -423,7 +490,7 @@ private encode(protocols: []const string) -> Result[Buf[u8], Error]
         val bytes = name.bytes
 
         if bytes.len == 0 || bytes.len > 255
-            return Err(Error(c.SSL_ERROR_SSL, 0, s"`${name}` is not a protocol name ALPN can carry"))
+            return Err(Error(c.SSL_ERROR_SSL, 0, s"`${name}` is not a protocol name ALPN can carry", 0))
 
         out.push(u8(bytes.len))
         out.extend(bytes)
@@ -554,7 +621,7 @@ end server
 
 // Read the certificate chain and install it.
 private present(ctx: *c.SslCtx, pem: []const u8) -> Result[unit, Error]
-    if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "the certificate is empty"))
+    if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "the certificate is empty", 0))
 
     val bio = c.bio_new_mem_buf(as_ptr(pem), i32(pem.len))
 
@@ -599,7 +666,7 @@ end present
 
 // Read the private key and install it.
 private unlock(ctx: *c.SslCtx, pem: []const u8) -> Result[unit, Error]
-    if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "the private key is empty"))
+    if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "the private key is empty", 0))
 
     val bio = c.bio_new_mem_buf(as_ptr(pem), i32(pem.len))
 

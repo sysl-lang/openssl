@@ -1,0 +1,212 @@
+// Why a certificate was refused, told apart.
+//
+// **Two clients that fail the same way and for different reasons.** A client that trusts the issuer
+// but is talking to the wrong host, and a client that does not trust the issuer at all, both end a
+// handshake with "certificate verify failed" in `code`. `Error.verify` and `refusal()` are what
+// separate them, so each case here is a real handshake between two `Stream`s with the certificate
+// that causes it, and the table at the bottom pins every verdict's mapping on its own.
+
+module sh.sysl.openssl
+@tests
+
+import sh.sysl.openssl.c
+import sysl.harness.*
+
+// The self-signed `localhost` certificate the server tests use, and its key. Good until 2126.
+private certificate() -> string = raw"""
+    -----BEGIN CERTIFICATE-----
+    MIIBlTCCATugAwIBAgIUNnjUBn4q7ivoXFJz0saQZ08Pg5swCgYIKoZIzj0EAwIw
+    FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDgyOTE3NTA0NVoYDzIxMjYwODA1
+    MTc1MDQ1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+    PQMBBwNCAARZbqWolNURbZ5e+9vJOe4TUurlpW+RHEs8akmv+IIIIA/rj97/iCuM
+    BhyvxVOtuyLYisY/u8tssfGB9Ae2cToOo2kwZzAdBgNVHQ4EFgQUVFT1Ath9z+UO
+    ZTtYvB+5kS4sWbowHwYDVR0jBBgwFoAUVFT1Ath9z+UOZTtYvB+5kS4sWbowDwYD
+    VR0TAQH/BAUwAwEB/zAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwID
+    SAAwRQIgT5Z9B0gkwqI38hKMz4j6Qfz7soV1nIJDkQL2ybMM/v8CIQDL4P1sRuQe
+    l1AsfZSnSUHdcgf31iyWtYdG7TDjTT1SSQ==
+    -----END CERTIFICATE-----
+    """
+
+private key() -> string = raw"""
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgBb9GvwtNPeyKbu1H
+    iKg570Z07OItc1S5qkEx3mMK0HGhRANCAARZbqWolNURbZ5e+9vJOe4TUurlpW+R
+    HEs8akmv+IIIIA/rj97/iCuMBhyvxVOtuyLYisY/u8tssfGB9Ae2cToO
+    -----END PRIVATE KEY-----
+    """
+
+// **The same key and the same name, with a validity of the whole of 2020.** Made with `openssl req
+// -x509 -key ... -not_before 20200101000000Z -not_after 20210101000000Z`, so what differs from the
+// certificate above is the dates and nothing else -- the one thing the test is about.
+private expired() -> string = raw"""
+    -----BEGIN CERTIFICATE-----
+    MIIBcTCCARigAwIBAgIUGwA+Mdqq8koTMJBrortQwMHlR/swCgYIKoZIzj0EAwIw
+    FDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTIwMDEwMTAwMDAwMFoXDTIxMDEwMTAw
+    MDAwMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+    AQcDQgAEWW6lqJTVEW2eXvvbyTnuE1Lq5aVvkRxLPGpJr/iCCCAP64/e/4grjAYc
+    r8VTrbsi2IrGP7vLbLHxgfQHtnE6DqNIMEYwHQYDVR0OBBYEFFRU9QLYfc/lDmU7
+    WLwfuZEuLFm6MBQGA1UdEQQNMAuCCWxvY2FsaG9zdDAPBgNVHRMBAf8EBTADAQH/
+    MAoGCCqGSM49BAMCA0cAMEQCIA4Di7h8tHJuvVsX0AhHWLHMh0Bgepi9fF62dX3I
+    U+mSAiALTFGvwN+OlYG02j/7o8ZXCINI0voaEITpp3QW4wYjxg==
+    -----END CERTIFICATE-----
+    """
+
+private pump(from: &Stream, to: &Stream)
+    var out: [16384]u8
+
+    loop
+        val n = from.outgoing(out[0..<16384])
+
+        if n == 0 then break
+
+        to.incoming(out[0..<n]).unwrap()
+    end loop
+end pump
+
+// Drive both ends until the handshake settles. **The client is asked first**, as the module comment
+// prescribes, and its failure is the one answered: that is the end that checks the certificate.
+private settle(cl: &Stream, sv: &Stream) -> Result[unit, Error]
+    for round in 0..<16
+        val a = cl.handshake()?
+
+        pump(cl, sv)
+
+        val b = sv.handshake()?
+
+        pump(sv, cl)
+
+        if a == Step.Done && b == Step.Done then return Ok(())
+    end for
+
+    Err(fail(c.SSL_ERROR_SSL, "the handshake never settled"))
+end settle
+
+// What a handshake between a client trusting `trusted` (or nobody, when it is empty) and a server
+// presenting `presented` says when the client dials `host`.
+private attempt(presented: string, trusted: string, host: string) -> Result[unit, Error]
+    val sv = server(presented.bytes, key().bytes).unwrap()
+    val cl = client().unwrap()
+
+    if trusted.len > 0 then cl.trust(trusted.bytes).unwrap()
+
+    val a = connect(cl, host).unwrap()
+    val b = accept(sv).unwrap()
+
+    settle(a, b)
+end attempt
+
+// A refusal's name, so a test can compare cases rather than match them.
+private named(e: Error) -> string
+    e.refusal() match
+        None -> "none"
+        Some(r) -> r match
+            HostMismatch -> "host"
+            Expired -> "expired"
+            NotYetValid -> "early"
+            Untrusted -> "untrusted"
+            Other(code) -> s"other ${code}"
+end named
+
+private refused(presented: string, trusted: string, host: string) -> Error
+    val r = attempt(presented, trusted, host)
+
+    assert(r.is_err(), "a handshake that had to be refused completed")
+
+    r.unwrap_err()
+end refused
+
+@test
+a_trusted_certificate_for_another_host_is_a_host_mismatch()
+    val e = refused(certificate(), certificate(), "other.example")
+
+    assert_eq(e.verify, c.X509_V_ERR_HOSTNAME_MISMATCH)
+    assert_eq(named(e), "host")
+    assert(e.message.contains("certificate verify failed"), e.message)
+    assert(e.message.contains("hostname mismatch"), e.message)
+
+@test
+a_certificate_nobody_trusts_is_untrusted()
+    val e = refused(certificate(), "", "localhost")
+
+    assert_eq(e.verify, c.X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT)
+    assert_eq(named(e), "untrusted")
+    assert(e.message.contains("certificate verify failed"), e.message)
+    assert(e.message.contains("self-signed certificate"), e.message)
+
+@test
+the_two_refusals_share_a_code_and_differ_in_verify()
+    // **The reason the field exists.** Both carry OpenSSL's one "certificate verify failed" code, so
+    // nothing but `verify` tells a caller which of the two it has.
+    val host = refused(certificate(), certificate(), "other.example")
+    val trust = refused(certificate(), "", "localhost")
+
+    assert_eq(host.code, trust.code)
+    assert(host.verify != trust.verify, "the two refusals were indistinguishable")
+
+@test
+an_expired_certificate_is_expired()
+    val e = refused(expired(), expired(), "localhost")
+
+    assert_eq(e.verify, c.X509_V_ERR_CERT_HAS_EXPIRED)
+    assert_eq(named(e), "expired")
+    assert(e.message.contains("certificate has expired"), e.message)
+
+@test
+an_expired_certificate_that_is_also_untrusted_reports_the_issuer_first()
+    // OpenSSL stops at the first thing wrong, and the chain is checked before the dates.
+    val e = refused(expired(), "", "localhost")
+
+    assert_eq(named(e), "untrusted")
+
+@test
+a_handshake_that_succeeds_leaves_verify_zero()
+    val sv = server(certificate().bytes, key().bytes).unwrap()
+    val cl = client().unwrap()
+
+    cl.trust(certificate().bytes).unwrap()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    settle(a, b).unwrap()
+
+@test
+a_failure_that_is_not_a_certificate_refusal_has_no_refusal()
+    // ALPN with nothing in common fails the handshake on a perfectly good certificate.
+    val sv = server(certificate().bytes, key().bytes).unwrap()
+    val cl = client().unwrap()
+
+    cl.trust(certificate().bytes).unwrap()
+    sv.offer(["h2"]).unwrap()
+    cl.offer(["spdy/3"]).unwrap()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+    val r = settle(a, b)
+
+    assert(r.is_err())
+    assert_eq(r.unwrap_err().verify, 0)
+    assert(r.unwrap_err().refusal().is_none())
+
+@test
+errors_made_without_a_handshake_carry_no_verdict()
+    val e = client().unwrap().trust("".bytes).unwrap_err()
+
+    assert_eq(e.verify, 0)
+    assert(e.refusal().is_none())
+
+@test
+every_verdict_maps_to_the_refusal_a_caller_acts_on()
+    // **One row per code, so swapping two mappings turns a row red.** The numbers are OpenSSL's
+    // `X509_V_ERR_*` values, written out because the constants under test are what they check.
+    assert_eq(named(Error(1, 0, "", 0)), "none")
+    assert_eq(named(Error(1, 0, "", 62)), "host")
+    assert_eq(named(Error(1, 0, "", 10)), "expired")
+    assert_eq(named(Error(1, 0, "", 9)), "early")
+    assert_eq(named(Error(1, 0, "", 2)), "untrusted")
+    assert_eq(named(Error(1, 0, "", 18)), "untrusted")
+    assert_eq(named(Error(1, 0, "", 19)), "untrusted")
+    assert_eq(named(Error(1, 0, "", 20)), "untrusted")
+    assert_eq(named(Error(1, 0, "", 21)), "untrusted")
+    assert_eq(named(Error(1, 0, "", 23)), "other 23")
+    assert_eq(named(Error(1, 0, "", 4)), "other 4")

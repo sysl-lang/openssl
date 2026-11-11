@@ -84,7 +84,7 @@ private_key(pem: []const u8) -> Result[&PrivateKey, Error]
 end private_key
 
 private read(pem: []const u8, public: bool) -> Result[*c.EvpPkey, Error]
-    if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "there was no key in those bytes"))
+    if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "there was no key in those bytes", 0))
 
     c.err_clear_error()
 
@@ -158,7 +158,7 @@ private suits(key: *c.EvpPkey, alg: Algorithm) -> Result[unit, Error]
     if wanted == c.EVP_PKEY_RSA && id == c.EVP_PKEY_RSA_PSS && pss_of(alg) then return Ok(())
 
     if id != wanted
-        return Err(Error(c.SSL_ERROR_SSL, 0, s"this key is not one ${name_of(alg)} is about"))
+        return Err(Error(c.SSL_ERROR_SSL, 0, s"this key is not one ${name_of(alg)} is about", 0))
 
     Ok(())
 end suits
@@ -184,7 +184,7 @@ verify(key: &PublicKey, alg: Algorithm, message: []const u8, signature: []const 
     if n != 0
         if signature.len != 2 * n
             return Err(Error(c.SSL_ERROR_SSL, 0,
-                s"an ${name_of(alg)} signature is ${2 * n} bytes and this one is ${signature.len}"))
+                s"an ${name_of(alg)} signature is ${2 * n} bytes and this one is ${signature.len}", 0))
 
         carried = der_of(signature, n)
         sig = carried.view()
@@ -271,7 +271,7 @@ sign(key: &PrivateKey, alg: Algorithm, message: []const u8) -> Result[Buf[u8], E
 
     raw_of(room[0..<wrote], n) match
         Some(out) -> Ok(out)
-        None -> Err(Error(c.SSL_ERROR_SSL, 0, s"OpenSSL produced a signature ${name_of(alg)} cannot carry"))
+        None -> Err(Error(c.SSL_ERROR_SSL, 0, s"OpenSSL produced a signature ${name_of(alg)} cannot carry", 0))
 end sign
 
 // PSS with a salt the length of the digest, which is what JOSE specifies.
