@@ -6,7 +6,7 @@ TLS for sysl — both ends — bound over OpenSSL's memory BIOs, plus the digest
 
 ```
 dependencies {
-  openssl { git = "github.com/sysl-lang/openssl", version = "0.2.4" }
+  openssl { git = "github.com/sysl-lang/openssl", version = "0.2.5" }
 }
 ```
 
@@ -111,6 +111,22 @@ two ends with nothing in common fail the handshake, which is what RFC 7301 asks 
 
 `None` from `protocol()` is an ordinary answer: a peer that offered nothing, or supports no ALPN at
 all, leaves it unset and the connection is fine.
+
+### Protocol versions
+
+TLS 1.2 is the default floor at both ends. `min_version(v)`, `max_version(v)` and `versions(min, max)`
+on a `Client` or a `Server` set the range with a `Version` (`Tls10` to `Tls13`); `versions` refuses a
+floor above its ceiling. `Stream.version()` answers the negotiated version once the handshake has
+finished, and `None` before. TLS 1.0 and 1.1 are nameable, but OpenSSL's default security level
+refuses them.
+
+### Keying material and channel binding
+
+`Stream.export_keying_material(label, context, len)` derives `len` bytes from the session's secrets
+(RFC 5705, RFC 8446 section 7.5); both ends get the same bytes, and they differ by label, context and
+connection. RFC 9266 `tls-exporter` is label `EXPORTER-Channel-Binding`, no context, 32 bytes. Only
+after the handshake has finished. `None` and an empty context are different under TLS 1.2 and the
+same under TLS 1.3.
 
 ## Signing and verifying
 

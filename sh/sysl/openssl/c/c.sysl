@@ -128,6 +128,19 @@ extern "SSL_pending" ssl_pending(ssl: *Ssl) -> i32
 // The general setting call every `SSL_set_*` macro expands to.
 extern "SSL_ctrl" ssl_ctrl(ssl: *Ssl, cmd: i32, larg: i64, parg: *u8) -> i64
 
+// Whether the handshake has finished (1) or not (0).
+extern "SSL_is_init_finished" ssl_is_init_finished(ssl: *Ssl) -> i32
+
+// The protocol version this connection speaks, as the wire number (`TLS1_3_VERSION`). **Only
+// meaningful once the handshake has finished**; before that it is whatever the method started as.
+extern "SSL_version" ssl_version(ssl: *Ssl) -> i32
+
+// RFC 5705 / RFC 8446 section 7.5 keying material: `outlen` bytes derived from the session's secrets
+// for `label`. **`use_context` is what separates "no context" from "an empty context"**, which derive
+// different bytes under TLS 1.2 and the same under TLS 1.3. Answers 1 on success; 0 or -1 when it cannot (no handshake yet, a label OpenSSL
+// reserves, a length too large).
+extern "SSL_export_keying_material" ssl_export_keying_material(ssl: *Ssl, out: *u8, outlen: usize, label: *u8, llen: usize, context: *u8, contextlen: usize, use_context: i32) -> i32
+
 // ## The two memory buffers
 //
 // **This is the whole reason the binding is small.** OpenSSL is not given the socket: it is given a
@@ -246,7 +259,11 @@ c const
     SSL_CTRL_SET_TLSEXT_HOSTNAME: i32 = "SSL_CTRL_SET_TLSEXT_HOSTNAME"
     SSL_CTRL_SET_MIN_PROTO_VERSION: i32 = "SSL_CTRL_SET_MIN_PROTO_VERSION"
     TLSEXT_NAMETYPE_host_name: i32 = "TLSEXT_NAMETYPE_host_name"
+    SSL_CTRL_SET_MAX_PROTO_VERSION: i32 = "SSL_CTRL_SET_MAX_PROTO_VERSION"
+    TLS1_VERSION: i32 = "TLS1_VERSION"
+    TLS1_1_VERSION: i32 = "TLS1_1_VERSION"
     TLS1_2_VERSION: i32 = "TLS1_2_VERSION"
+    TLS1_3_VERSION: i32 = "TLS1_3_VERSION"
     X509_V_OK: i64 = "X509_V_OK"
     X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT: i64 = "X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT"
     X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY: i64 = "X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY"

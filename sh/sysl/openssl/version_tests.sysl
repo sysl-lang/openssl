@@ -1,0 +1,328 @@
+// What the protocol-version range and the keying-material export claim, run without a network.
+//
+// **Two `Stream`s in one process with their buffers crossed by hand**, as in `server_tests.sysl`:
+// the version a pair negotiates and the secrets they derive are properties of a real handshake, so
+// the real handshake is what is driven.
+
+module sh.sysl.openssl
+@tests
+
+import sh.sysl.openssl.c
+import sysl.harness.*
+
+private certificate() -> string = raw"""
+    -----BEGIN CERTIFICATE-----
+    MIIBlTCCATugAwIBAgIUNnjUBn4q7ivoXFJz0saQZ08Pg5swCgYIKoZIzj0EAwIw
+    FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDgyOTE3NTA0NVoYDzIxMjYwODA1
+    MTc1MDQ1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+    PQMBBwNCAARZbqWolNURbZ5e+9vJOe4TUurlpW+RHEs8akmv+IIIIA/rj97/iCuM
+    BhyvxVOtuyLYisY/u8tssfGB9Ae2cToOo2kwZzAdBgNVHQ4EFgQUVFT1Ath9z+UO
+    ZTtYvB+5kS4sWbowHwYDVR0jBBgwFoAUVFT1Ath9z+UOZTtYvB+5kS4sWbowDwYD
+    VR0TAQH/BAUwAwEB/zAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwID
+    SAAwRQIgT5Z9B0gkwqI38hKMz4j6Qfz7soV1nIJDkQL2ybMM/v8CIQDL4P1sRuQe
+    l1AsfZSnSUHdcgf31iyWtYdG7TDjTT1SSQ==
+    -----END CERTIFICATE-----
+    """
+
+private key() -> string = raw"""
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgBb9GvwtNPeyKbu1H
+    iKg570Z07OItc1S5qkEx3mMK0HGhRANCAARZbqWolNURbZ5e+9vJOe4TUurlpW+R
+    HEs8akmv+IIIIA/rj97/iCuMBhyvxVOtuyLYisY/u8tssfGB9Ae2cToO
+    -----END PRIVATE KEY-----
+    """
+
+private pump(from: &Stream, to: &Stream)
+    var out: [16384]u8
+
+    loop
+        val n = from.outgoing(out[0..<16384])
+
+        if n == 0 then break
+
+        to.incoming(out[0..<n]).unwrap()
+    end loop
+end pump
+
+private settle(cl: &Stream, sv: &Stream) -> Result[unit, Error]
+    for round in 0..<16
+        val a = cl.handshake()?
+
+        pump(cl, sv)
+
+        val b = sv.handshake()?
+
+        pump(sv, cl)
+
+        if a == Step.Done && b == Step.Done then return Ok(())
+    end for
+
+    Err(fail(c.SSL_ERROR_SSL, "the handshake never settled"))
+end settle
+
+private trusting() -> &Client
+    val cl = client().unwrap()
+
+    cl.trust(certificate().bytes).unwrap()
+
+    cl
+end trusting
+
+private tls_server() -> &Server = server(certificate().bytes, key().bytes).unwrap()
+
+private is(found: Option[Version], expected: Version) -> bool
+    found match
+        Some(v) -> v == expected
+        None -> false
+
+// -- the range ---------------------------------------------------------------------------------------
+
+@test
+a_server_pinned_to_tls_13_accepts_a_tls_13_client()
+    val sv = tls_server()
+    val cl = trusting()
+
+    sv.min_version(Version.Tls13).unwrap()
+    cl.min_version(Version.Tls13).unwrap()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    settle(a, b).unwrap()
+
+    assert(is(a.version(), Version.Tls13), "the client did not report TLS 1.3")
+    assert(is(b.version(), Version.Tls13), "the server did not report TLS 1.3")
+
+@test
+a_server_pinned_to_tls_13_refuses_a_client_capped_at_tls_12()
+    val sv = tls_server()
+    val cl = trusting()
+
+    sv.min_version(Version.Tls13).unwrap()
+    cl.max_version(Version.Tls12).unwrap()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    assert(settle(a, b).is_err(), "a TLS 1.2 client completed a handshake with a TLS 1.3-only server")
+    assert(a.version().is_none() || b.version().is_none(), "a refused pair reported a negotiated version")
+
+@test
+a_client_that_wants_tls_13_refuses_a_server_capped_at_tls_12()
+    val sv = tls_server()
+    val cl = trusting()
+
+    sv.max_version(Version.Tls12).unwrap()
+    cl.min_version(Version.Tls13).unwrap()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    assert(settle(a, b).is_err(), "a TLS 1.3-only client completed a handshake with a TLS 1.2 server")
+
+@test
+a_ceiling_of_tls_12_negotiates_tls_12()
+    val sv = tls_server()
+    val cl = trusting()
+
+    cl.versions(Version.Tls12, Version.Tls12).unwrap()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    settle(a, b).unwrap()
+
+    assert(is(a.version(), Version.Tls12), "the client was held to 1.2 and did not report it")
+    assert(is(b.version(), Version.Tls12), "the server was offered only 1.2 and did not report it")
+
+@test
+an_unrestricted_pair_negotiates_the_newest_version()
+    val a = connect(trusting(), "localhost").unwrap()
+    val b = accept(tls_server()).unwrap()
+
+    settle(a, b).unwrap()
+
+    assert(is(a.version(), Version.Tls13))
+    assert(is(b.version(), Version.Tls13))
+
+@test
+no_version_is_reported_before_the_handshake_has_finished()
+    val a = connect(trusting(), "localhost").unwrap()
+    val b = accept(tls_server()).unwrap()
+
+    assert(a.version().is_none(), "a client that has not begun reported a version")
+    assert(b.version().is_none(), "a server that has not begun reported a version")
+
+    // Half way through is still before the end.
+    a.handshake().unwrap()
+    pump(a, b)
+
+    assert(a.version().is_none(), "a client that sent its hello reported a version")
+
+@test
+a_range_whose_floor_is_above_its_ceiling_is_refused_at_both_ends()
+    val sv = tls_server()
+    val cl = trusting()
+
+    assert(sv.versions(Version.Tls13, Version.Tls12).is_err(), "a server took a floor above its ceiling")
+    assert(cl.versions(Version.Tls13, Version.Tls12).is_err(), "a client took a floor above its ceiling")
+    assert(cl.versions(Version.Tls12, Version.Tls13).is_ok())
+    assert(sv.versions(Version.Tls12, Version.Tls12).is_ok(), "a one-version range was refused")
+
+@test
+a_range_refused_for_its_order_changes_nothing()
+    // **The check runs before either end is set**, so a refused pair leaves the context as it was.
+    val sv = tls_server()
+    val cl = trusting()
+
+    assert(cl.versions(Version.Tls13, Version.Tls12).is_err())
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    settle(a, b).unwrap()
+
+    assert(is(a.version(), Version.Tls13), "a refused range altered the context")
+
+// -- keying material ---------------------------------------------------------------------------------
+
+// Both ends of one finished handshake.
+private struct Pair
+    a: &Stream
+    b: &Stream
+
+private established(cl: &Client, sv: &Server) -> Pair
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    settle(a, b).unwrap()
+
+    Pair(a, b)
+end established
+
+private channel_binding() -> string = "EXPORTER-Channel-Binding"
+
+@test
+both_ends_export_the_same_keying_material_of_the_requested_length()
+    val sv = tls_server()
+    val ends = established(trusting(), sv)
+
+    val a = ends.a.export_keying_material(channel_binding(), None, 32).unwrap()
+    val b = ends.b.export_keying_material(channel_binding(), None, 32).unwrap()
+
+    assert_eq(a.len(), 32)
+    assert_eq(b.len(), 32)
+    assert(a.view() == b.view(), "the two ends derived different keying material")
+
+    // Not a run of one byte: an exporter that wrote nothing would also agree with itself.
+    var distinct = false
+
+    for i in 1..<a.len()
+        if a[i] != a[0] then distinct = true
+
+    assert(distinct, "the exported bytes are all one value")
+
+@test
+other_lengths_are_honoured_and_a_longer_export_extends_nothing_it_was_not_asked_for()
+    val sv = tls_server()
+    val ends = established(trusting(), sv)
+
+    val short = ends.a.export_keying_material("a label", None, 16).unwrap()
+    val long = ends.a.export_keying_material("a label", None, 64).unwrap()
+
+    assert_eq(short.len(), 16)
+    assert_eq(long.len(), 64)
+    assert(ends.b.export_keying_material("a label", None, 64).unwrap().view() == long.view())
+
+@test
+keying_material_differs_across_labels()
+    val sv = tls_server()
+    val ends = established(trusting(), sv)
+
+    val a = ends.a.export_keying_material("EXPORTER-one", None, 32).unwrap()
+    val b = ends.a.export_keying_material("EXPORTER-two", None, 32).unwrap()
+
+    assert(a.view() != b.view(), "two labels derived the same bytes")
+
+@test
+keying_material_differs_across_contexts()
+    val sv = tls_server()
+    val ends = established(trusting(), sv)
+
+    val none = ends.a.export_keying_material("EXPORTER-x", None, 32).unwrap()
+    val empty = ends.a.export_keying_material("EXPORTER-x", Some("".bytes), 32).unwrap()
+    val one = ends.a.export_keying_material("EXPORTER-x", Some("one".bytes), 32).unwrap()
+    val two = ends.a.export_keying_material("EXPORTER-x", Some("two".bytes), 32).unwrap()
+
+    // **TLS 1.3 defines no context and an empty one to be the same** (RFC 8446 section 7.5).
+    assert(none.view() == empty.view(), "TLS 1.3 told no context from an empty one")
+    assert(one.view() != two.view(), "two contexts derived the same bytes")
+    assert(one.view() != none.view())
+
+    // And the peer agrees for the same context.
+    assert(ends.b.export_keying_material("EXPORTER-x", Some("one".bytes), 32).unwrap().view() == one.view())
+
+@test
+under_tls_12_no_context_and_an_empty_context_are_different()
+    val cl = trusting()
+
+    cl.max_version(Version.Tls12).unwrap()
+
+    val ends = established(cl, tls_server())
+
+    val none = ends.a.export_keying_material("EXPORTER-x", None, 32).unwrap()
+    val empty = ends.a.export_keying_material("EXPORTER-x", Some("".bytes), 32).unwrap()
+
+    assert(none.view() != empty.view(), "TLS 1.2 derived the same bytes for no context and an empty one")
+    assert(ends.b.export_keying_material("EXPORTER-x", Some("".bytes), 32).unwrap().view() == empty.view())
+
+@test
+keying_material_differs_across_connections()
+    val sv = tls_server()
+    val cl = trusting()
+    val first = established(cl, sv)
+    val second = established(cl, sv)
+
+    val a = first.a.export_keying_material(channel_binding(), None, 32).unwrap()
+    val b = second.a.export_keying_material(channel_binding(), None, 32).unwrap()
+
+    assert(a.view() != b.view(), "two connections derived the same channel binding")
+
+@test
+keying_material_is_exported_under_tls_12_as_well()
+    val sv = tls_server()
+    val cl = trusting()
+    cl.max_version(Version.Tls12).unwrap()
+
+    val ends = established(cl, sv)
+
+    assert(is(ends.a.version(), Version.Tls12))
+
+    val a = ends.a.export_keying_material(channel_binding(), None, 32).unwrap()
+    val b = ends.b.export_keying_material(channel_binding(), None, 32).unwrap()
+
+    assert(a.view() == b.view())
+
+// -- the error paths ---------------------------------------------------------------------------------
+
+@test
+keying_material_cannot_be_exported_before_the_handshake()
+    val a = connect(trusting(), "localhost").unwrap()
+    val b = accept(tls_server()).unwrap()
+
+    assert(a.export_keying_material(channel_binding(), None, 32).is_err(), "a client exported before its handshake")
+    assert(b.export_keying_material(channel_binding(), None, 32).is_err(), "a server exported before its handshake")
+
+    // Part way is not enough either.
+    a.handshake().unwrap()
+    pump(a, b)
+
+    assert(a.export_keying_material(channel_binding(), None, 32).is_err(), "a client exported mid-handshake")
+
+@test
+an_export_with_no_label_or_no_length_is_refused()
+    val sv = tls_server()
+    val ends = established(trusting(), sv)
+
+    assert(ends.a.export_keying_material("", None, 32).is_err(), "an empty label was accepted")
+    assert(ends.a.export_keying_material(channel_binding(), None, 0).is_err(), "a zero length was accepted")
