@@ -92,7 +92,7 @@ private settle(cl: &Stream, sv: &Stream) -> Result[unit, Error]
 end settle
 
 // A client that trusts the fixture above and nothing else new.
-private trusting() -> &Client
+private trusting() -> &sync Client
     val cl = client().unwrap()
 
     cl.trust(certificate().bytes).unwrap()

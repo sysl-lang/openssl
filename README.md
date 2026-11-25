@@ -128,6 +128,64 @@ connection. RFC 9266 `tls-exporter` is label `EXPORTER-Channel-Binding`, no cont
 after the handshake has finished. `None` and an empty context are different under TLS 1.2 and the
 same under TLS 1.3.
 
+### One context, every thread
+
+`client()` answers a `&sync Client` and `server(...)` a `&sync Server`: **build one context and hand it
+to every thread that connects.** A client context reads the machine's whole trust store when it is
+made, which is most of what a handshake costs; reusing one costs nothing. A `Stream` keeps its context
+alive through an atomically counted reference, so the streams of one context may live on any threads,
+and the context is freed when the last of them and the last name for it are gone.
+
+**A context is configured before its first connection and never after.** OpenSSL lets `SSL_new` run
+on several threads at once, but nothing about changing a setting while another thread's handshake reads
+it. So the first `connect` or `accept` seals the context, and every setter after that — `trust`,
+`offer`, the version setters and the session settings below — answers an `Error` instead of racing. A
+lock makes the seal exact: a setter that began before the first connection has finished before its
+`SSL_new`. After the seal nothing takes the lock again.
+
+### Session resumption
+
+A client resumes by keeping the `Session` a connection left and offering it to the next one:
+
+```
+val s = connect(cl, "example.com")?
+// ... handshake, then at least one receive, then close
+val kept = s.session()                     // Option[&sync Session]
+
+val next = connect(cl, "example.com")?
+kept match
+    Some(k) -> next.resume(k)?             // before the handshake begins
+    None -> ()
+// ... handshake
+next.reused()                              // true when the server accepted it
+```
+
+- **Under TLS 1.3 the tickets arrive after the handshake**, so `session()` is `None` until the client
+  has called `receive` once with the server's bytes fed in.
+- **A connection dropped without `close` loses its session.** OpenSSL treats an end with no
+  close-notify as a possible truncation attack and stops resuming its session; `Session.resumable()`
+  turns `false`. Close both ends with a goodbye.
+- **A `Session` may cross threads** (`&sync Session`): OpenSSL counts its references atomically and a
+  resumable session does not change, so one connection's session may be offered from any thread, or
+  from several at once.
+- `resume` is refused on a server stream and once the handshake has begun, rather than quietly making a
+  full handshake.
+
+A server is configured, before its first `accept`, with:
+
+| setting | what it does |
+|---|---|
+| `session_cache(size)` | remember up to `size` sessions (on by default at OpenSSL's 20480); 0 is refused, since OpenSSL reads it as unlimited |
+| `no_session_cache()` | remember none; tickets still resume |
+| `session_id_context(id)` | 1 to 32 bytes naming this server; a session is resumed only by a server with the same one |
+| `tickets(on)` | issue stateless tickets (default) or not; off, TLS 1.3 sends tickets naming cache entries, and with the cache off as well it sends none |
+| `ticket_keys(keys)` | exactly 80 bytes (16-byte name, 32-byte HMAC key, 32-byte AES key); servers given the same keys and id context resume each other's tickets |
+
+**There is no ticket-key rotation in place**, deliberately: OpenSSL reads the keys inside every
+handshake with no lock, so rewriting them while another thread decrypts a ticket is a torn read.
+Rotating is building a new `Server` with the new keys and accepting on it from then on; connections on
+the old one keep it alive until they end.
+
 ## Signing and verifying
 
 Enough to check a JWT's signature. **This is the crypto, not a JWT library** — a token is three
@@ -172,7 +230,17 @@ sudo pacman -S openssl          # Arch
 
 ## Testing
 
-`sysl test .` — 38 tests, **none of which needs a network.**
+`sysl test .` — 94 tests, **none of which needs a network.**
+
+The sharing tests run one `Client` and one `Server` through eight threads handshaking at once, a
+context whose every name is gone before its streams' handshake, and the seal at both ends, including
+a connection made on another thread sealing the context here. The session tests resume and decline in
+pairs, each setting tested by a pair that would resume without it and does not with it: two servers
+sharing ticket keys and an id context resume each other's tickets, and a different id context, different
+keys, or tickets off stops it; a cache of one forgets the older session; a session crosses threads both
+ways and is offered from eight at once. Every new setting was broken on purpose and seen to turn a test
+red. A program sharing both contexts across eight threads with a session offered from each is net zero
+on the counted heap (`SYSL_COUNT_ALLOCS=1`).
 
 That is the memory-BIO design paying for itself twice over. The client tests drive the real OpenSSL
 through the real buffers with only the peer missing. The server tests stand a `Client` and a `Server`
@@ -197,5 +265,5 @@ than assumed.
 
 ## What is missing
 
-Session resumption, client certificates, SNI callbacks on the server side, and building a key from a
+A ticket-key rotation callback (see above for why there is none), client certificates, SNI callbacks on the server side, and building a key from a
 JWKS document's `n`/`e` or `x`/`y` rather than from PEM. None is hard; none has a consumer yet.

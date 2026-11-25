@@ -60,7 +60,7 @@ private settle(cl: &Stream, sv: &Stream) -> Result[unit, Error]
     Err(fail(c.SSL_ERROR_SSL, "the handshake never settled"))
 end settle
 
-private trusting() -> &Client
+private trusting() -> &sync Client
     val cl = client().unwrap()
 
     cl.trust(certificate().bytes).unwrap()
@@ -68,7 +68,7 @@ private trusting() -> &Client
     cl
 end trusting
 
-private tls_server() -> &Server = server(certificate().bytes, key().bytes).unwrap()
+private tls_server() -> &sync Server =server(certificate().bytes, key().bytes).unwrap()
 
 private is(found: Option[Version], expected: Version) -> bool
     found match
@@ -191,7 +191,7 @@ private struct Pair
     a: &Stream
     b: &Stream
 
-private established(cl: &Client, sv: &Server) -> Pair
+private established(cl: &sync Client, sv: &sync Server) -> Pair
     val a = connect(cl, "localhost").unwrap()
     val b = accept(sv).unwrap()
 

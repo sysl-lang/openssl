@@ -1,0 +1,451 @@
+// What session resumption claims, run without a network.
+//
+// **Every cell is a pair of real handshakes**: the first leaves a session behind, the second offers
+// it, and both ends are asked whether it was resumed. A resumption is a property of what the server
+// remembers, what it can decrypt and what it calls itself, so each setting is tested by a pair that
+// would resume without it and does not with it -- or the other way round.
+
+module sh.sysl.openssl
+@tests
+
+import sh.sysl.openssl.c
+import sysl.harness.*
+import sysl.buf.{Buf, buf}
+import sysl.threads.{scope, ScopedThread}
+
+private certificate() -> string = raw"""
+    -----BEGIN CERTIFICATE-----
+    MIIBlTCCATugAwIBAgIUNnjUBn4q7ivoXFJz0saQZ08Pg5swCgYIKoZIzj0EAwIw
+    FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDgyOTE3NTA0NVoYDzIxMjYwODA1
+    MTc1MDQ1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+    PQMBBwNCAARZbqWolNURbZ5e+9vJOe4TUurlpW+RHEs8akmv+IIIIA/rj97/iCuM
+    BhyvxVOtuyLYisY/u8tssfGB9Ae2cToOo2kwZzAdBgNVHQ4EFgQUVFT1Ath9z+UO
+    ZTtYvB+5kS4sWbowHwYDVR0jBBgwFoAUVFT1Ath9z+UOZTtYvB+5kS4sWbowDwYD
+    VR0TAQH/BAUwAwEB/zAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwID
+    SAAwRQIgT5Z9B0gkwqI38hKMz4j6Qfz7soV1nIJDkQL2ybMM/v8CIQDL4P1sRuQe
+    l1AsfZSnSUHdcgf31iyWtYdG7TDjTT1SSQ==
+    -----END CERTIFICATE-----
+    """
+
+private key() -> string = raw"""
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgBb9GvwtNPeyKbu1H
+    iKg570Z07OItc1S5qkEx3mMK0HGhRANCAARZbqWolNURbZ5e+9vJOe4TUurlpW+R
+    HEs8akmv+IIIIA/rj97/iCuMBhyvxVOtuyLYisY/u8tssfGB9Ae2cToO
+    -----END PRIVATE KEY-----
+    """
+
+private pump(from: &Stream, to: &Stream)
+    var out: [16384]u8
+
+    loop
+        val n = from.outgoing(out[0..<16384])
+
+        if n == 0 then break
+
+        to.incoming(out[0..<n]).unwrap()
+    end loop
+end pump
+
+private settle(cl: &Stream, sv: &Stream) -> Result[unit, Error]
+    for round in 0..<16
+        val a = cl.handshake()?
+
+        pump(cl, sv)
+
+        val b = sv.handshake()?
+
+        pump(sv, cl)
+
+        if a == Step.Done && b == Step.Done then return Ok(())
+    end for
+
+    Err(fail(c.SSL_ERROR_SSL, "the handshake never settled"))
+end settle
+
+private trusting() -> &sync Client
+    val cl = client().unwrap()
+
+    cl.trust(certificate().bytes).unwrap()
+
+    cl
+end trusting
+
+private tls_server() -> &sync Server = server(certificate().bytes, key().bytes).unwrap()
+
+// What one connection left behind, and whether it was itself a resumption at each end.
+struct Visit
+    session: Option[&sync Session]
+    client_reused: bool
+    server_reused: bool
+
+// One whole connection: offer `offered` if there is one, settle, **read once**, which is what takes
+// in the tickets a TLS 1.3 server sends after its handshake, and **close both ends**, since OpenSSL
+// forgets the session of a connection dropped without a goodbye.
+private visit(cl: &sync Client, sv: &sync Server, offered: Option[&sync Session]) -> Visit
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    offered match
+        Some(s) -> a.resume(s).unwrap()
+        None -> ()
+
+    settle(a, b).unwrap()
+
+    var got: [64]u8
+
+    a.receive(got[0..<64]).unwrap() match
+        Wants -> ()
+        Data(_) -> assert(false, "a client read data nobody sent")
+        Closed -> assert(false, "a client saw a closed session straight after its handshake")
+
+    val made = Visit(a.session(), a.reused(), b.reused())
+
+    a.close()
+    pump(a, b)
+    b.close()
+    pump(b, a)
+
+    made
+end visit
+
+// The session of a connection whose streams are dropped, both of them, with no `close`.
+private cut_short(cl: &sync Client, sv: &sync Server) -> &sync Session
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    settle(a, b).unwrap()
+
+    var got: [64]u8
+
+    a.receive(got[0..<64]).unwrap()
+
+    val s = a.session().expect("the connection left no session")
+
+    assert(s.resumable(), "a session read from a live connection was not resumable")
+
+    s
+end cut_short
+
+@test
+a_connection_dropped_without_a_goodbye_leaves_no_resumable_session()
+    // **OpenSSL's rule, kept rather than worked round**: a connection that ends without a
+    // close-notify may have been cut short by an attacker, so its session is not resumed. The
+    // `Session` already handed out says so.
+    val cl = trusting()
+    val sv = tls_server()
+    val s = cut_short(cl, sv)
+
+    assert(!s.resumable(), "a session outlived its connection being dropped without a goodbye")
+    assert(!visit(cl, sv, Some(s)).server_reused, "a session from a connection cut short was resumed")
+
+// Two visits, the second offering the first's session: answers whether the second resumed, and
+// insists that both ends agree about it.
+private resumes(cl: &sync Client, first: &sync Server, second: &sync Server) -> bool
+    val v = visit(cl, first, None)
+
+    assert(!v.client_reused && !v.server_reused, "a first connection reported a resumption")
+
+    val s = v.session.expect("the first connection left no resumable session")
+    val w = visit(cl, second, Some(s))
+
+    assert_eq(w.client_reused, w.server_reused)
+
+    w.client_reused
+end resumes
+
+// Eighty bytes of ticket keys, different for each `seed`.
+private keys(seed: u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    for i in 0..<80
+        out.push(seed +% u8(i))
+
+    out
+end keys
+
+@test
+a_session_offered_back_to_the_server_that_issued_it_is_resumed()
+    val sv = tls_server()
+
+    assert(resumes(trusting(), sv, sv))
+
+@test
+a_connection_offering_no_session_is_not_resumed()
+    val cl = trusting()
+    val sv = tls_server()
+
+    visit(cl, sv, None)
+
+    val w = visit(cl, sv, None)
+
+    assert(!w.client_reused, "the client resumed a session it never offered")
+    assert(!w.server_reused, "the server resumed a session nobody offered")
+
+@test
+a_tls_13_session_is_not_resumable_until_the_ticket_has_been_read()
+    // **The ticket comes after the handshake**, so a client that asks before reading has nothing
+    // worth keeping -- and `None` says so rather than a session that would make a full handshake.
+    val a = connect(trusting(), "localhost").unwrap()
+    val b = accept(tls_server()).unwrap()
+
+    settle(a, b).unwrap()
+
+    assert(a.version() == Some(Version.Tls13))
+    assert(a.session().is_none(), "a TLS 1.3 session was resumable before any ticket was read")
+
+    var got: [64]u8
+
+    a.receive(got[0..<64]).unwrap()
+
+    assert(a.session().is_some(), "reading the server's tickets left no resumable session")
+
+@test
+a_tls_12_session_is_resumable_as_soon_as_the_handshake_ends()
+    val cl = trusting()
+    val sv = tls_server()
+
+    cl.max_version(Version.Tls12).unwrap()
+
+    val a = connect(cl, "localhost").unwrap()
+    val b = accept(sv).unwrap()
+
+    settle(a, b).unwrap()
+
+    val s = a.session().expect("a finished TLS 1.2 handshake left no session")
+
+    val w = visit(cl, sv, Some(s))
+
+    assert(w.client_reused && w.server_reused, "a TLS 1.2 session was not resumed")
+
+@test
+a_session_from_one_server_is_not_resumed_by_another_with_a_different_id_context()
+    // **Both servers decrypt each other's tickets**, so the id context is the only thing between
+    // them -- the control below, with the same context, is what shows the keys would have let it in.
+    val one = tls_server()
+    val two = tls_server()
+
+    one.ticket_keys(keys(7).view()).unwrap()
+    two.ticket_keys(keys(7).view()).unwrap()
+    one.session_id_context("server-one".bytes).unwrap()
+    two.session_id_context("server-two".bytes).unwrap()
+
+    assert(!resumes(trusting(), one, two), "a session was resumed by a server calling itself something else")
+
+@test
+a_session_from_one_server_is_resumed_by_another_with_the_same_keys_and_id_context()
+    // The id contexts are slices of longer strings, equal over their first eight bytes: **a binding
+    // that read past the slice would see two different contexts and refuse.**
+    val one = tls_server()
+    val two = tls_server()
+
+    one.ticket_keys(keys(7).view()).unwrap()
+    two.ticket_keys(keys(7).view()).unwrap()
+    one.session_id_context("pool-abc/one".bytes[0..<8]).unwrap()
+    two.session_id_context("pool-abc/two".bytes[0..<8]).unwrap()
+
+    assert(resumes(trusting(), one, two), "two servers sharing keys and a context did not resume each other's session")
+
+@test
+servers_with_different_ticket_keys_do_not_resume_each_others_tickets()
+    val one = tls_server()
+    val two = tls_server()
+
+    one.ticket_keys(keys(7).view()).unwrap()
+    two.ticket_keys(keys(9).view()).unwrap()
+
+    assert(!resumes(trusting(), one, two), "a ticket was decrypted under different keys")
+
+@test
+ticket_keys_are_read_from_the_slice_they_are_given()
+    // Eighty bytes cut from the middle of a longer buffer: **the same eighty at both servers**, so
+    // a binding that read from the buffer's start would give them different keys.
+    var long: Buf[u8] = buf()
+
+    for i in 0..<200
+        long.push(u8(i))
+
+    val one = tls_server()
+    val two = tls_server()
+
+    one.ticket_keys(long.view()[40..<120]).unwrap()
+    two.ticket_keys(keys(40).view()).unwrap()
+
+    assert(resumes(trusting(), one, two), "the same eighty bytes, one of them a slice, were not the same keys")
+
+@test
+with_tickets_and_the_cache_both_off_nothing_resumes()
+    val sv = tls_server()
+
+    sv.tickets(false).unwrap()
+    sv.no_session_cache().unwrap()
+
+    // **Under TLS 1.3 the server then sends no ticket at all**, so the client has nothing to keep.
+    val cl = trusting()
+
+    assert(visit(cl, sv, None).session.is_none(), "a server with no cache and no tickets sent a resumable ticket")
+
+    // Under TLS 1.2 either answer is nothing resumed: no session for the client, or one that the
+    // server, keeping nothing, makes a full handshake of.
+    val old = trusting()
+
+    old.max_version(Version.Tls12).unwrap()
+
+    val nothing = visit(old, sv, None).session match
+        None -> true
+        Some(s) -> !visit(old, sv, Some(s)).server_reused
+
+    assert(nothing, "a TLS 1.2 server with no cache and no tickets resumed a session")
+
+@test
+with_tickets_off_the_cache_resumes()
+    val sv = tls_server()
+
+    sv.tickets(false).unwrap()
+    sv.session_cache(16).unwrap()
+
+    assert(resumes(trusting(), sv, sv), "a server remembering its sessions did not resume one with tickets off")
+
+@test
+a_cache_turned_off_and_back_on_resumes_again()
+    // **`session_cache` turns the cache on as well as sizing it**, so it undoes `no_session_cache`.
+    val sv = tls_server()
+
+    sv.tickets(false).unwrap()
+    sv.no_session_cache().unwrap()
+    sv.session_cache(16).unwrap()
+
+    assert(resumes(trusting(), sv, sv), "a cache turned back on did not resume a session")
+
+@test
+with_the_cache_off_a_ticket_resumes()
+    val sv = tls_server()
+
+    sv.tickets(true).unwrap()
+    sv.no_session_cache().unwrap()
+
+    assert(resumes(trusting(), sv, sv), "a ticket was not resumed by a server with no cache")
+
+@test
+tickets_off_turn_off_resumption_across_servers_that_share_keys()
+    // **With tickets off the session lives in one server's cache**, so a second server with the same
+    // keys and context -- which would decrypt a ticket -- has nothing to look it up in.
+    val one = tls_server()
+    val two = tls_server()
+
+    for sv in [one, two]
+        sv.ticket_keys(keys(3).view()).unwrap()
+        sv.session_id_context("same".bytes).unwrap()
+        sv.tickets(false).unwrap()
+
+    assert(!resumes(trusting(), one, two), "a session was resumed by a server that never saw it, with tickets off")
+
+@test
+tickets_turned_off_and_back_on_resume_across_servers_that_share_keys()
+    // The cell above with the last word changed: **`tickets(true)` has to undo `tickets(false)`**,
+    // or the second server has nothing to decrypt.
+    val one = tls_server()
+    val two = tls_server()
+
+    for sv in [one, two]
+        sv.ticket_keys(keys(3).view()).unwrap()
+        sv.session_id_context("same".bytes).unwrap()
+        sv.tickets(false).unwrap()
+        sv.tickets(true).unwrap()
+
+    assert(resumes(trusting(), one, two), "tickets turned back on did not resume across servers sharing keys")
+
+@test
+a_session_cache_of_one_forgets_the_older_session()
+    // Tickets off, so the cache is the only memory: **the second session pushes the first out.**
+    val cl = trusting()
+    val sv = tls_server()
+
+    sv.tickets(false).unwrap()
+    sv.session_cache(1).unwrap()
+
+    val first = visit(cl, sv, None).session.expect("no first session")
+    val second = visit(cl, sv, None).session.expect("no second session")
+
+    assert(visit(cl, sv, Some(second)).server_reused, "the session the cache still holds was not resumed")
+    assert(!visit(cl, sv, Some(first)).server_reused, "a cache of one resumed the session it had to forget")
+
+@test
+a_session_crosses_threads_both_ways()
+    // **A `&sync Session`**: one made here is resumed on another thread, and one made on another
+    // thread is resumed here.
+    val cl = trusting()
+    val sv = tls_server()
+
+    val here = visit(cl, sv, None).session.expect("no session to send")
+
+    val there = scope((s) ->
+        val t = s.spawn(() -> visit(cl, sv, Some(here)).client_reused)
+        val u = s.spawn(() -> visit(cl, sv, None).session)
+
+        assert(t.join(), "a session made on one thread was not resumed on another")
+
+        u.join())
+
+    val back = there.expect("the other thread left no session")
+
+    assert(visit(cl, sv, Some(back)).server_reused, "a session made on another thread was not resumed here")
+
+@test
+one_session_offered_from_eight_threads_at_once_resumes_on_each()
+    val cl = trusting()
+    val sv = tls_server()
+    val s = visit(cl, sv, None).session.expect("no session to share")
+
+    val resumed = scope((sc) ->
+        var ts: Buf[ScopedThread[bool]] = buf()
+
+        for i in 0..<8
+            ts.push(sc.spawn(() -> visit(cl, sv, Some(s)).server_reused))
+
+        var n = 0
+
+        for t in ts
+            if t.join() then n += 1
+
+        n)
+
+    assert_eq(resumed, 8)
+
+@test
+a_server_stream_does_not_offer_a_session()
+    val cl = trusting()
+    val sv = tls_server()
+    val s = visit(cl, sv, None).session.expect("no session")
+
+    assert(accept(sv).unwrap().resume(s).is_err(), "a server stream took a session to offer")
+
+@test
+a_session_is_not_offered_once_the_handshake_has_begun()
+    val cl = trusting()
+    val sv = tls_server()
+    val s = visit(cl, sv, None).session.expect("no session")
+
+    val a = connect(cl, "localhost").unwrap()
+
+    a.handshake().unwrap()
+
+    assert(a.resume(s).is_err(), "a session was offered after the ClientHello had gone")
+
+@test
+nothing_is_reused_before_the_handshake_has_finished()
+    val a = connect(trusting(), "localhost").unwrap()
+
+    assert(!a.reused())
+    assert(a.session().is_none())
+
+@test
+resumption_settings_that_cannot_mean_anything_are_refused()
+    val sv = tls_server()
+
+    assert(sv.session_cache(0).is_err(), "a cache of size 0, which OpenSSL reads as unlimited, was taken")
+    assert(sv.session_id_context("".bytes).is_err(), "an empty id context was taken")
+    assert(sv.session_id_context("0123456789abcdef0123456789abcdefX".bytes).is_err(), "a 33-byte id context was taken")
+    assert(sv.session_id_context("0123456789abcdef0123456789abcdef".bytes).is_ok(), "a 32-byte id context was refused")
+    assert(sv.ticket_keys(keys(1).view()[0..<79]).is_err(), "79 bytes of ticket keys were taken")
+    assert(sv.ticket_keys(keys(1).view()).is_ok(), "80 bytes of ticket keys were refused")

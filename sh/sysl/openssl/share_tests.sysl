@@ -1,0 +1,246 @@
+// What a shared context claims: one `&sync Client` and one `&sync Server` serving connections on
+// several threads at once, a context outliving every name but its streams' references, and the seal
+// that refuses a setting once a connection has been made.
+
+module sh.sysl.openssl
+@tests
+
+import sh.sysl.openssl.c
+import sysl.harness.*
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+import sysl.threads.{scope, ScopedThread}
+
+private certificate() -> string = raw"""
+    -----BEGIN CERTIFICATE-----
+    MIIBlTCCATugAwIBAgIUNnjUBn4q7ivoXFJz0saQZ08Pg5swCgYIKoZIzj0EAwIw
+    FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDgyOTE3NTA0NVoYDzIxMjYwODA1
+    MTc1MDQ1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+    PQMBBwNCAARZbqWolNURbZ5e+9vJOe4TUurlpW+RHEs8akmv+IIIIA/rj97/iCuM
+    BhyvxVOtuyLYisY/u8tssfGB9Ae2cToOo2kwZzAdBgNVHQ4EFgQUVFT1Ath9z+UO
+    ZTtYvB+5kS4sWbowHwYDVR0jBBgwFoAUVFT1Ath9z+UOZTtYvB+5kS4sWbowDwYD
+    VR0TAQH/BAUwAwEB/zAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwID
+    SAAwRQIgT5Z9B0gkwqI38hKMz4j6Qfz7soV1nIJDkQL2ybMM/v8CIQDL4P1sRuQe
+    l1AsfZSnSUHdcgf31iyWtYdG7TDjTT1SSQ==
+    -----END CERTIFICATE-----
+    """
+
+private key() -> string = raw"""
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgBb9GvwtNPeyKbu1H
+    iKg570Z07OItc1S5qkEx3mMK0HGhRANCAARZbqWolNURbZ5e+9vJOe4TUurlpW+R
+    HEs8akmv+IIIIA/rj97/iCuMBhyvxVOtuyLYisY/u8tssfGB9Ae2cToO
+    -----END PRIVATE KEY-----
+    """
+
+private pump(from: &Stream, to: &Stream)
+    var out: [16384]u8
+
+    loop
+        val n = from.outgoing(out[0..<16384])
+
+        if n == 0 then break
+
+        to.incoming(out[0..<n]).unwrap()
+    end loop
+end pump
+
+private settle(cl: &Stream, sv: &Stream) -> Result[unit, Error]
+    for round in 0..<16
+        val a = cl.handshake()?
+
+        pump(cl, sv)
+
+        val b = sv.handshake()?
+
+        pump(sv, cl)
+
+        if a == Step.Done && b == Step.Done then return Ok(())
+    end for
+
+    Err(fail(c.SSL_ERROR_SSL, "the handshake never settled"))
+end settle
+
+private trusting() -> &sync Client
+    val cl = client().unwrap()
+
+    cl.trust(certificate().bytes).unwrap()
+
+    cl
+end trusting
+
+private tls_server() -> &sync Server = server(certificate().bytes, key().bytes).unwrap()
+
+// A pair of connected streams, client first.
+struct Pair
+    a: &Stream
+    b: &Stream
+
+// One plaintext round trip over a settled pair: answers whether `ping` arrived and `pong` came back.
+private round_trip(p: Pair) -> bool
+    p.a.send("ping".bytes).unwrap()
+    pump(p.a, p.b)
+
+    var got: [64]u8
+
+    val heard = p.b.receive(got[0..<64]).unwrap() match
+        Data(n) -> from_utf8_unchecked(got[0..<n]) == "ping"
+        _ -> false
+
+    p.b.send("pong".bytes).unwrap()
+    pump(p.b, p.a)
+
+    val answered = p.a.receive(got[0..<64]).unwrap() match
+        Data(n) -> from_utf8_unchecked(got[0..<n]) == "pong"
+        _ -> false
+
+    heard && answered
+end round_trip
+
+// `rounds` whole connections over one shared context at each end, each handshaking, agreeing on
+// ALPN and carrying bytes: answers how many came through. **The host is a slice of a longer
+// string**, so a binding that read past it would ask the certificate for the wrong name.
+private connections(cl: &sync Client, sv: &sync Server, rounds: int) -> int
+    var good = 0
+
+    for i in 0..<rounds
+        val a = connect(cl, "localhost.invalid"[0..<9]).unwrap()
+        val b = accept(sv).unwrap()
+
+        if settle(a, b).is_err() then continue
+
+        if a.protocol() != Some("h2") then continue
+
+        if round_trip(Pair(a, b)) then good += 1
+
+    good
+end connections
+
+// A client and a server configured for ALPN and then shared.
+private configured() -> Pair2
+    val cl = trusting()
+    val sv = tls_server()
+
+    cl.offer(["h2", "http/1.1"]).unwrap()
+    sv.offer(["h2"]).unwrap()
+
+    Pair2(cl, sv)
+end configured
+
+struct Pair2
+    cl: &sync Client
+    sv: &sync Server
+
+@test
+one_context_at_each_end_serves_eight_threads_handshaking_at_once()
+    val p = configured()
+    val cl = p.cl
+    val sv = p.sv
+
+    val good = scope((s) ->
+        var ts: Buf[ScopedThread[int]] = buf()
+
+        for i in 0..<8
+            ts.push(s.spawn(() -> connections(cl, sv, 6)))
+
+        var n = 0
+
+        for t in ts
+            n += t.join()
+
+        n)
+
+    assert_eq(good, 48)
+
+@test
+a_context_shared_across_threads_still_serves_the_thread_that_made_it()
+    val p = configured()
+    val cl = p.cl
+    val sv = p.sv
+
+    val there = scope((s) -> s.spawn(() -> connections(cl, sv, 2)).join())
+
+    assert_eq(there, 2)
+    assert_eq(connections(cl, sv, 2), 2)
+
+// Streams whose contexts have no name left anywhere but inside the streams.
+private orphaned() -> Pair
+    val p = configured()
+
+    Pair(connect(p.cl, "localhost").unwrap(), accept(p.sv).unwrap())
+end orphaned
+
+@test
+a_context_dropped_while_streams_hold_it_still_serves_them()
+    // **Every name for both contexts is gone before the handshake begins**, so only the streams'
+    // own references keep them; a stream that held only the pointer would be reading freed memory,
+    // which the ASan run of this suite would report.
+    val p = orphaned()
+
+    settle(p.a, p.b).unwrap()
+
+    assert(p.a.protocol() == Some("h2"), "a context kept alive only by its stream lost its protocol list")
+    assert(round_trip(p))
+
+@test
+a_client_is_configured_before_its_first_connection_and_refused_after()
+    val cl = client().unwrap()
+
+    assert(cl.trust(certificate().bytes).is_ok(), "a fresh client would not be configured")
+    assert(cl.min_version(Version.Tls12).is_ok())
+
+    connect(cl, "localhost").unwrap()
+
+    assert(cl.trust(certificate().bytes).is_err(), "a client took a new authority after a connection had been made from it")
+    assert(cl.offer(["h2"]).is_err(), "a client took a protocol list after a connection")
+    assert(cl.min_version(Version.Tls13).is_err(), "a client changed its floor after a connection")
+    assert(cl.max_version(Version.Tls12).is_err(), "a client changed its ceiling after a connection")
+    assert(cl.versions(Version.Tls12, Version.Tls13).is_err(), "a client changed its range after a connection")
+
+@test
+a_server_is_configured_before_its_first_connection_and_refused_after()
+    val sv = tls_server()
+
+    assert(sv.offer(["h2"]).is_ok(), "a fresh server would not be configured")
+
+    accept(sv).unwrap()
+
+    assert(sv.offer(["http/1.1"]).is_err(), "a server swapped its protocol list after a connection")
+    assert(sv.min_version(Version.Tls13).is_err())
+    assert(sv.max_version(Version.Tls12).is_err())
+    assert(sv.versions(Version.Tls12, Version.Tls13).is_err())
+    assert(sv.session_cache(8).is_err(), "a server resized its cache after a connection")
+    assert(sv.no_session_cache().is_err())
+    assert(sv.session_id_context("x".bytes).is_err())
+    assert(sv.tickets(false).is_err(), "a server turned tickets off after a connection")
+
+    var k: Buf[u8] = buf()
+
+    for i in 0..<80
+        k.push(u8(i))
+
+    assert(sv.ticket_keys(k.view()).is_err(), "a server rewrote its ticket keys after a connection")
+
+@test
+a_refused_setting_leaves_the_context_as_it_was()
+    // The seal refuses the change, it does not half-make it: **the protocol list offered before the
+    // first connection is still the one agreed on after the refusal.**
+    val p = configured()
+
+    val first = Pair(connect(p.cl, "localhost").unwrap(), accept(p.sv).unwrap())
+
+    assert(p.sv.offer(["http/1.1"]).is_err())
+
+    settle(first.a, first.b).unwrap()
+
+    assert(first.a.protocol() == Some("h2"))
+
+@test
+a_connection_made_on_another_thread_seals_the_context_here()
+    val cl = trusting()
+    val sv = tls_server()
+
+    scope((s) -> s.spawn(() -> connections(cl, sv, 1)).join())
+
+    assert(cl.offer(["h2"]).is_err(), "a client sealed on another thread took a setting here")
+    assert(sv.tickets(false).is_err(), "a server sealed on another thread took a setting here")

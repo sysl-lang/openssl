@@ -40,6 +40,7 @@ import sysl.text.{cstring, from_cstring, from_utf8_unchecked}
 import sysl.slices.as_ptr
 import sysl.raw.ptr_cast
 import sysl.buf.{Buf, buf, buf_filled}
+import sysl.sync.{Atomic, SpinLock}
 
 // What went wrong, in OpenSSL's own words where it has any.
 //
@@ -203,97 +204,168 @@ private bound(ctx: *c.SslCtx, min: Version, max: Version) -> Result[unit, Error]
     pin(ctx, c.SSL_CTRL_SET_MAX_PROTO_VERSION, max)
 end bound
 
+// -- configuring a context that is shared ----------------------------------------------------------
+
+// **A context is configured before its first connection and never after**, and this is what holds
+// it to that.
+//
+// A context is shared by every connection made from it, and those connections may be on several
+// threads at once: `SSL_new` and every handshake read the context's settings with no lock. OpenSSL
+// makes `SSL_new` safe to call concurrently, and makes nothing safe about changing a setting while
+// another thread's handshake is reading it -- a protocol list swapped under a handshake, or ticket
+// keys rewritten half way through a decryption, is a torn read. So the first `connect` or `accept`
+// *seals* the context, and every setter after that is refused with an `Error` rather than racing.
+//
+// **The lock is what makes the seal sound rather than merely likely.** A setter takes it and checks
+// the seal inside it; the first connection takes it to set the seal. A setter that began before the
+// first connection has therefore finished before that connection's `SSL_new`, and one that begins
+// after it sees the seal. After the seal the lock is never taken again: a connection reads the flag
+// alone, so sharing a context costs no contention.
+private[openssl] struct Gate
+    lock: SpinLock
+    sealed: Atomic[u32]
+
+    // Run one configuration step, unless a connection has already been made from this context.
+    configure(*self, step: () -> Result[unit, Error]) -> Result[unit, Error]
+        self.lock.lock()
+
+        val done = if self.sealed.load() != 0 then Err(in_use()) else step()
+
+        self.lock.unlock()
+        done
+    end configure
+
+    // Say that a connection is being made, so that no setting changes from now on.
+    seal(*self)
+        if self.sealed.load() != 0 then return
+
+        self.lock.lock()
+        self.sealed.store(1)
+        self.lock.unlock()
+end Gate
+
+private gate() -> Gate = Gate(SpinLock(0), Atomic(0))
+
+private in_use() -> Error =
+    Error(c.SSL_ERROR_SSL, 0, "this context has made a connection already, and a context is configured before its first connection and never after", 0)
+
 // -- the context ----------------------------------------------------------------------------------
 
 // The settings every connection under it shares: which protocol versions, and which certificates to
-// trust. Made once.
+// trust. Made once, configured before its first `connect`, and then shared.
 //
-// **It is a `&Client` because OpenSSL frees it and something has to say when.** `SSL_new` takes a
-// reference on the context, so a connection outliving its context would be reading freed memory --
-// which is why a `Stream` holds its client rather than only its pointer.
+// **It is a `&sync Client` so that one context can serve connections on every thread.** Building a
+// client context reads the machine's whole trust store, which costs milliseconds -- most of a
+// handshake's cost -- and reusing one costs nothing. `SSL_new` takes a reference on the context,
+// so a connection outliving its context would be reading freed memory, which is why a `Stream`
+// holds its client rather than only its pointer; that reference's count is atomic, so the streams
+// holding it may be on any thread. **The setters below are refused once a connection has been made
+// from it** -- see `Gate`.
+//
+// **`@unchecked(Share)` is the promise `Gate` keeps**: every setter writes the `SSL_CTX` under the
+// gate's lock and only before the seal, so no write ever meets a connection's read.
+@unchecked(Share)
 struct Client
     ctx: *c.SslCtx
+    private gate: Gate
 
     // Trust one more certificate authority, on top of the machine's own store.
     //
     // **Additive, and there is deliberately nothing here that lowers the bar.** A private authority,
     // a corporate root, or the self-signed certificate a test stands up are all the same case: more
     // is trusted, never less. The PEM may hold several, and every one of them is added.
-    trust(&self, pem: []const u8) -> Result[unit, Error]
-        if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "there was nothing to trust", 0))
+    trust(*self, pem: []const u8) -> Result[unit, Error]
+        val ctx = self.ctx
 
-        val store = c.ctx_get_cert_store(self.ctx)
-
-        if store == null then return Err(fail(c.SSL_ERROR_SSL, "this context has no trust store"))
-
-        val bio = c.bio_new_mem_buf(as_ptr(pem), i32(pem.len))
-
-        if bio == null then return Err(fail(c.SSL_ERROR_SSL, "could not read the certificate"))
-
-        var found: usize = 0
-        var trouble: Option[Error] = None
-
-        loop
-            val x = c.pem_read_bio_x509(bio, null, null, null)
-
-            if x == null then break
-
-            // **`add_cert` takes a reference of its own**, so the one handed over is still owed a
-            // free -- and a duplicate is refused rather than counted, which is why the answer is
-            // read but a repeat is not an error worth reporting.
-            val rc = c.store_add_cert(store, x)
-
-            c.x509_free(x)
-
-            if rc != 1
-                trouble = Some(fail(c.SSL_ERROR_SSL, "that certificate was refused"))
-                break
-
-            found += 1
-        end loop
-
-        c.bio_free(bio)
-
-        trouble match
-            Some(e) -> return Err(e)
-            None -> ()
-
-        if found == 0 then return Err(fail(c.SSL_ERROR_SSL, "there was no certificate in those bytes"))
-
-        Ok(())
-    end trust
+        self.gate.configure(() -> add_trust(ctx, pem))
 
     // Offer these application protocols, most preferred first.
     //
     // **The list is copied by OpenSSL here and is not on the server side**, which is the asymmetry
     // to know: a client hands over bytes and forgets them, a server hands over a pointer the
     // callback will read later.
-    offer(&self, protocols: []const string) -> Result[unit, Error]
-        val list = encode(protocols)?
+    offer(*self, protocols: []const string) -> Result[unit, Error]
+        val ctx = self.ctx
 
-        // **Zero is success.** Almost every other call in OpenSSL answers 1, and this one answers 0
-        // -- a binding that checked for 1 would report every successful call as a failure.
-        if c.ctx_set_alpn_protos(self.ctx, as_ptr(list.view()), u32(list.len())) != 0
-            return Err(fail(c.SSL_ERROR_SSL, "the protocol list was refused"))
+        self.gate.configure(() ->
+            val list = encode(protocols)?
 
-        Ok(())
+            // **Zero is success.** Almost every other call in OpenSSL answers 1, and this one answers
+            // 0 -- a binding that checked for 1 would report every successful call as a failure.
+            if c.ctx_set_alpn_protos(ctx, as_ptr(list.view()), u32(list.len())) != 0
+                return Err(fail(c.SSL_ERROR_SSL, "the protocol list was refused"))
+
+            Ok(()))
     end offer
 
     // The lowest protocol version this end will speak. **The default is TLS 1.2**, so this is for
     // raising it (TLS 1.3 only) or, with care, lowering it.
-    min_version(&self, version: Version) -> Result[unit, Error] = pin(self.ctx, c.SSL_CTRL_SET_MIN_PROTO_VERSION, version)
+    min_version(*self, version: Version) -> Result[unit, Error]
+        val ctx = self.ctx
+
+        self.gate.configure(() -> pin(ctx, c.SSL_CTRL_SET_MIN_PROTO_VERSION, version))
 
     // The highest protocol version this end will speak. **There is no default ceiling.**
-    max_version(&self, version: Version) -> Result[unit, Error] = pin(self.ctx, c.SSL_CTRL_SET_MAX_PROTO_VERSION, version)
+    max_version(*self, version: Version) -> Result[unit, Error]
+        val ctx = self.ctx
+
+        self.gate.configure(() -> pin(ctx, c.SSL_CTRL_SET_MAX_PROTO_VERSION, version))
 
     // Both at once, refusing a pair that leaves nothing to speak (`min` above `max`) -- which the
     // two single setters cannot see, since each knows only its own side.
-    versions(&self, min: Version, max: Version) -> Result[unit, Error]
-        bound(self.ctx, min, max)
+    versions(*self, min: Version, max: Version) -> Result[unit, Error]
+        val ctx = self.ctx
+
+        self.gate.configure(() -> bound(ctx, min, max))
 end Client
 
 impl Drop for Client
     drop(self) = c.ctx_free(self.ctx)
+
+// Add every certificate in `pem` to the context's trust store.
+private add_trust(ctx: *c.SslCtx, pem: []const u8) -> Result[unit, Error]
+    if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "there was nothing to trust", 0))
+
+    val store = c.ctx_get_cert_store(ctx)
+
+    if store == null then return Err(fail(c.SSL_ERROR_SSL, "this context has no trust store"))
+
+    val bio = c.bio_new_mem_buf(as_ptr(pem), i32(pem.len))
+
+    if bio == null then return Err(fail(c.SSL_ERROR_SSL, "could not read the certificate"))
+
+    var found: usize = 0
+    var trouble: Option[Error] = None
+
+    loop
+        val x = c.pem_read_bio_x509(bio, null, null, null)
+
+        if x == null then break
+
+        // **`add_cert` takes a reference of its own**, so the one handed over is still owed a free
+        // -- and a duplicate is refused rather than counted, which is why the answer is read but a
+        // repeat is not an error worth reporting.
+        val rc = c.store_add_cert(store, x)
+
+        c.x509_free(x)
+
+        if rc != 1
+            trouble = Some(fail(c.SSL_ERROR_SSL, "that certificate was refused"))
+            break
+
+        found += 1
+    end loop
+
+    c.bio_free(bio)
+
+    trouble match
+        Some(e) -> return Err(e)
+        None -> ()
+
+    if found == 0 then return Err(fail(c.SSL_ERROR_SSL, "there was no certificate in those bytes"))
+
+    Ok(())
+end add_trust
 
 // A TLS client trusting the machine's certificate store.
 //
@@ -304,14 +376,17 @@ impl Drop for Client
 // answer with no maintenance in it.
 //
 // **TLS 1.2 is the floor.** Everything below it is broken in ways that have names.
-client() -> Result[&Client, Error]
+//
+// **Build one and share it.** Reading the store is most of what a handshake costs, so a context per
+// connection pays it every time; a `&sync Client` may be handed to every thread that connects.
+client() -> Result[&sync Client, Error]
     c.err_clear_error()
 
     val ctx = c.ctx_new(c.tls_client_method())
 
     if ctx == null then return Err(fail(c.SSL_ERROR_SSL, "could not make a TLS context"))
 
-    val made = Client(ctx)
+    val made: &sync Client = Client(ctx, gate())
 
     // **A refusal here is not survivable, so it is reported rather than warned about.** A client
     // that could not load the trust store would verify nothing, and a TLS client that verifies
@@ -498,6 +573,60 @@ struct Stream
         Ok(out)
     end export_keying_material
 
+    // The session this connection could be resumed from, or `None` while there is none worth keeping.
+    //
+    // **Under TLS 1.3 a client has nothing to keep when the handshake finishes.** The server sends
+    // its tickets *after* the handshake, so they are only read by the first `receive` after it --
+    // a client that wants to resume has to have called `receive` at least once (a `Wants` answer
+    // is enough) with the server's bytes fed in. Until a ticket has arrived the session OpenSSL holds
+    // is not resumable, and this answers `None` rather than handing out something that would only
+    // make the next handshake a full one.
+    //
+    // **The `Session` may cross threads**: OpenSSL counts its references atomically, and a session
+    // does not change once it is resumable, so one connection's session may be offered to a
+    // connection on any thread.
+    session(&self) -> Option[&sync Session]
+        val s = c.ssl_get1_session(self.ssl)
+
+        if s == null then return None
+
+        if c.session_is_resumable(s) != 1
+            c.session_free(s)
+
+            return None
+        end if
+
+        val kept: &sync Session = Session(s)
+
+        Some(kept)
+    end session
+
+    // Offer a session kept from an earlier connection, so that this handshake may resume it.
+    //
+    // **Only a client offers, and only before its handshake has begun** -- both are refused rather
+    // than ignored, since either would make a full handshake silently. Whether the server accepted
+    // the offer is `reused`, once the handshake has finished: a server that has forgotten the
+    // session, cannot read its ticket, or calls itself something different (`session_id_context`)
+    // answers with a full handshake, which is a slower connection and not a failure.
+    resume(&self, session: &sync Session) -> Result[unit, Error]
+        if c.ssl_is_server(self.ssl) == 1
+            return Err(Error(c.SSL_ERROR_SSL, 0, "a server does not offer a session; a client does", 0))
+
+        if c.ssl_in_before(self.ssl) != 1
+            return Err(Error(c.SSL_ERROR_SSL, 0, "a session is offered before the handshake begins, and this one has begun", 0))
+
+        c.err_clear_error()
+
+        if c.ssl_set_session(self.ssl, session.ptr) != 1
+            return Err(fail(c.SSL_ERROR_SSL, "OpenSSL would not take that session"))
+
+        Ok(())
+    end resume
+
+    // Whether the handshake resumed an earlier session rather than making a new one -- **asked of
+    // either end**, and `false` before the handshake has finished.
+    reused(self) -> bool = c.ssl_is_init_finished(self.ssl) == 1 && c.ssl_session_reused(self.ssl) == 1
+
     // Say goodbye. **Answered rather than insisted on**: a close-notify has to be written like
     // anything else, so the caller drains `outgoing` afterwards.
     close(&self) -> Step
@@ -531,11 +660,31 @@ impl Drop for Stream
     drop(self) = c.ssl_free(self.ssl)
 
 // Which context a `Stream` is keeping alive. **Nothing reads which one it is** -- it exists so the
-// context outlives the connections `SSL_new` took a reference for.
+// context outlives the connections `SSL_new` took a reference for. **Atomically counted**, since
+// the context's other streams may be on other threads, retaining and releasing it at the same time.
 private[openssl] enum Under
-    AsClient(of: &Client)
-    AsServer(of: &Server)
+    AsClient(of: &sync Client)
+    AsServer(of: &sync Server)
 end Under
+
+// A session one connection left behind, which a later connection to the same server may resume.
+//
+// **Held as a `&sync Session`**: OpenSSL counts a session's references atomically, so the handle may
+// be kept in a cache shared by every thread that connects. Freed when the last reference goes.
+//
+// **A session is only as good as the way its connection ended.** A connection dropped without
+// `close` may have been cut short by an attacker, so OpenSSL stops resuming its session -- and the
+// `Session` already handed out says so from then on (`resumable` turns `false`). Close a connection
+// with a goodbye, at both ends, and its session stays good.
+struct Session
+    private[openssl] ptr: *c.SslSession
+
+    // Whether offering this session could resume it: `false` once its connection was dropped
+    // without a goodbye. **Asked at the moment of asking** -- a server may still have forgotten it.
+    resumable(self) -> bool = c.session_is_resumable(self.ptr) == 1
+
+impl Drop for Session
+    drop(self) = c.session_free(self.ptr)
 
 // Begin a session with a named host.
 //
@@ -543,8 +692,12 @@ end Under
 // which a shared server does not know which certificate to send -- GitHub answers nothing at all --
 // and it is what the certificate's names are checked against, without which a valid certificate for
 // any host would satisfy the verification.
-connect(of: &Client, host: string) -> Result[&Stream, Error]
+//
+// **The first connection seals the context**: from here on its setters are refused.
+connect(of: &sync Client, host: string) -> Result[&Stream, Error]
     c.err_clear_error()
+
+    of.gate.seal()
 
     val ssl = c.ssl_new(of.ctx)
 
@@ -602,19 +755,19 @@ end encode
 // The settings every connection this end accepts will share: the certificate to present, the key
 // that goes with it, and the protocols on offer. Made once.
 //
-// **A `&Server` for the reason a `&Client` is one** -- `SSL_new` takes a reference on the context, so
-// a connection must not outlive it -- and for a second one: the ALPN callback is handed this
-// struct's own address, so it has to stay put.
+// **A `&sync Server` for the reason a `Client` is one** -- one context serves connections accepted
+// on every thread, and `SSL_new` takes a reference on it, so a connection must not outlive it -- and
+// for a second one: the ALPN callback is handed this struct's own address, so it has to stay put.
+// **Every setter is refused once a connection has been accepted** -- see `Gate`, whose lock and
+// seal are the synchronisation `@unchecked(Share)` promises, as for a `Client`.
+@unchecked(Share)
 struct Server
     ctx: *c.SslCtx
+    private gate: Gate
 
-    // The protocol list, kept because OpenSSL is given a pointer into it rather than a copy.
-    private protos: Buf[u8]
-
-    // That pointer and its length, taken once. **Read by the callback instead of the `Buf`**, so
-    // that nothing inside a C callback touches a container.
-    private list: *u8
-    private list_len: usize
+    // The protocol list. **Written only by `offer`, under the gate's lock and before the seal**, and
+    // read by the callback only after it.
+    private alpn: Alpn
 
     // Offer these application protocols, **most preferred first, and this end's order wins**.
     //
@@ -624,26 +777,127 @@ struct Server
     //
     // **The list is read later, from inside the handshake**, so it is kept on this struct -- which
     // is why a `Server` is a box and must not be copied.
-    offer(&self, protocols: []const string) -> Result[unit, Error]
-        self.protos = encode(protocols)?
-        self.list = as_ptr(self.protos.view())
-        self.list_len = self.protos.len()
+    offer(*self, protocols: []const string) -> Result[unit, Error]
+        val ctx = self.ctx
+        val me = self
 
-        c.ctx_set_alpn_select_cb(self.ctx, &pick, ptr_cast(&*self))
+        self.gate.configure(() ->
+            val protos = encode(protocols)?
 
-        Ok(())
+            me.alpn = Alpn(protos, as_ptr(protos.view()), protos.len())
+
+            c.ctx_set_alpn_select_cb(ctx, &pick, ptr_cast(me))
+
+            Ok(()))
     end offer
 
     // The lowest protocol version this end will accept. **The default is TLS 1.2.**
-    min_version(&self, version: Version) -> Result[unit, Error] = pin(self.ctx, c.SSL_CTRL_SET_MIN_PROTO_VERSION, version)
+    min_version(*self, version: Version) -> Result[unit, Error]
+        val ctx = self.ctx
+
+        self.gate.configure(() -> pin(ctx, c.SSL_CTRL_SET_MIN_PROTO_VERSION, version))
 
     // The highest protocol version this end will accept. **There is no default ceiling.**
-    max_version(&self, version: Version) -> Result[unit, Error] = pin(self.ctx, c.SSL_CTRL_SET_MAX_PROTO_VERSION, version)
+    max_version(*self, version: Version) -> Result[unit, Error]
+        val ctx = self.ctx
+
+        self.gate.configure(() -> pin(ctx, c.SSL_CTRL_SET_MAX_PROTO_VERSION, version))
 
     // Both at once, refusing a pair with `min` above `max`.
-    versions(&self, min: Version, max: Version) -> Result[unit, Error]
-        bound(self.ctx, min, max)
+    versions(*self, min: Version, max: Version) -> Result[unit, Error]
+        val ctx = self.ctx
+
+        self.gate.configure(() -> bound(ctx, min, max))
+
+    // Remember up to `size` sessions, so that a client offering one of them resumes it.
+    //
+    // **On by default**, at OpenSSL's own size (20480). This cache is what resumes a session when
+    // tickets are off; with tickets on, TLS 1.3 resumes from the ticket and the cache is not asked.
+    // **A size of 0 is refused**, because OpenSSL reads it as *unlimited* -- a cache that only grows
+    // is not something to ask for by accident. `no_session_cache` is the way to have none.
+    session_cache(*self, size: u64) -> Result[unit, Error]
+        if size == 0
+            return Err(Error(c.SSL_ERROR_SSL, 0, "a session cache of size 0 is unlimited to OpenSSL; say no_session_cache for none", 0))
+
+        val ctx = self.ctx
+
+        self.gate.configure(() ->
+            c.ctx_ctrl(ctx, c.SSL_CTRL_SET_SESS_CACHE_MODE, c.SSL_SESS_CACHE_SERVER, null)
+            c.ctx_ctrl(ctx, c.SSL_CTRL_SET_SESS_CACHE_SIZE, i64(size), null)
+
+            Ok(()))
+    end session_cache
+
+    // Remember no sessions. **Tickets are not affected**: a client holding a ticket carries its own
+    // session, which this end only has to decrypt.
+    no_session_cache(*self) -> Result[unit, Error]
+        val ctx = self.ctx
+
+        self.gate.configure(() ->
+            c.ctx_ctrl(ctx, c.SSL_CTRL_SET_SESS_CACHE_MODE, c.SSL_SESS_CACHE_OFF, null)
+
+            Ok(()))
+    end no_session_cache
+
+    // What this server calls itself when it issues a session: **a session is resumed only by a server
+    // with the same id context**, so two servers sharing ticket keys or a cache still refuse each
+    // other's sessions when the contexts differ. At most 32 bytes, and at least one.
+    session_id_context(*self, id: []const u8) -> Result[unit, Error]
+        if id.len == 0 || id.len > c.SSL_MAX_SID_CTX_LENGTH
+            return Err(Error(c.SSL_ERROR_SSL, 0, s"a session id context is 1 to ${c.SSL_MAX_SID_CTX_LENGTH} bytes, and this is ${id.len}", 0))
+
+        val ctx = self.ctx
+
+        self.gate.configure(() ->
+            if c.ctx_set_session_id_context(ctx, as_ptr(id), u32(id.len)) != 1
+                return Err(fail(c.SSL_ERROR_SSL, "the session id context was refused"))
+
+            Ok(()))
+    end session_id_context
+
+    // Issue session tickets (`true`, the default) or not.
+    //
+    // **A ticket is the whole session, encrypted under this server's ticket keys and kept by the
+    // client**, so resuming one needs no memory here. Off, a TLS 1.2 client gets no ticket and a
+    // TLS 1.3 client gets a ticket that only names a session in `session_cache` -- with the cache off
+    // as well, nothing resumes.
+    tickets(*self, on: bool) -> Result[unit, Error]
+        val ctx = self.ctx
+
+        self.gate.configure(() ->
+            if on then c.ctx_clear_options(ctx, c.SSL_OP_NO_TICKET) else c.ctx_set_options(ctx, c.SSL_OP_NO_TICKET)
+
+            Ok(()))
+    end tickets
+
+    // The keys tickets are encrypted under: **exactly 80 bytes** -- a 16-byte key name, a 32-byte
+    // HMAC secret and a 32-byte AES key, in that order. By default every server makes its own at
+    // random, so only servers given the same keys resume each other's tickets.
+    //
+    // **Set before the first connection, like every setting; there is no rotation in place.**
+    // OpenSSL reads these keys inside every handshake with no lock, so changing them while another
+    // thread decrypts a ticket is a torn read. Rotating is building a new `Server` with the new keys
+    // and accepting on it from then on; connections on the old one keep it alive until they end.
+    ticket_keys(*self, keys: []const u8) -> Result[unit, Error]
+        if keys.len != 80
+            return Err(Error(c.SSL_ERROR_SSL, 0, s"ticket keys are 80 bytes, and this is ${keys.len}", 0))
+
+        val ctx = self.ctx
+
+        self.gate.configure(() ->
+            if c.ctx_ctrl(ctx, c.SSL_CTRL_SET_TLSEXT_TICKET_KEYS, 80, as_ptr(keys)) != 1
+                return Err(fail(c.SSL_ERROR_SSL, "the ticket keys were refused"))
+
+            Ok(()))
+    end ticket_keys
 end Server
+
+// The protocol list a server offers, and a pointer into it taken once. **The callback reads the
+// pointer instead of the `Buf`**, so that nothing inside a C callback touches a container.
+private struct Alpn
+    protos: Buf[u8]
+    list: *u8
+    list_len: usize
 
 // Choose a protocol, from inside the handshake.
 //
@@ -655,10 +909,11 @@ end Server
 // than at anything built here.
 private pick(ssl: *c.Ssl, out: **u8, outlen: *u8, offered: *u8, offered_len: u32, arg: *u8) -> i32
     val sv: *Server = ptr_cast(arg)
+    val list = sv.alpn.list
 
-    if sv.list_len == 0 || offered_len == 0 then return c.SSL_TLSEXT_ERR_NOACK
+    if sv.alpn.list_len == 0 || offered_len == 0 then return c.SSL_TLSEXT_ERR_NOACK
 
-    val ours = sv.list[0..<sv.list_len]
+    val ours = list[0..<sv.alpn.list_len]
     val theirs = offered[0..<usize(offered_len)]
 
     var i: usize = 0
@@ -676,7 +931,7 @@ private pick(ssl: *c.Ssl, out: **u8, outlen: *u8, offered: *u8, offered_len: u32
             if m == 0 || j + 1 + m > theirs.len then break
 
             if m == n && ours[(i + 1)..<(i + 1 + n)] == theirs[(j + 1)..<(j + 1 + m)]
-                *out = ptr_cast(usize(sv.list) + i + 1)
+                *out = ptr_cast(usize(list) + i + 1)
                 *outlen = u8(n)
 
                 return c.SSL_TLSEXT_ERR_OK
@@ -705,14 +960,14 @@ impl Drop for Server
 // intermediate.
 //
 // **TLS 1.2 is the floor**, as it is for a client.
-server(certificate: []const u8, key: []const u8) -> Result[&Server, Error]
+server(certificate: []const u8, key: []const u8) -> Result[&sync Server, Error]
     c.err_clear_error()
 
     val ctx = c.ctx_new(c.tls_server_method())
 
     if ctx == null then return Err(fail(c.SSL_ERROR_SSL, "could not make a TLS context"))
 
-    val made = Server(ctx, buf(), ptr_cast(0usize), 0)
+    val made: &sync Server = Server(ctx, gate(), Alpn(buf(), ptr_cast(0usize), 0))
 
     present(ctx, certificate)?
     unlock(ctx, key)?
@@ -809,8 +1064,12 @@ end unlock
 //
 // **No host name and no verification.** A server presents a certificate rather than checking one,
 // and asking a client for one is a different feature this package does not offer.
-accept(of: &Server) -> Result[&Stream, Error]
+//
+// **The first connection seals the context**: from here on its setters are refused.
+accept(of: &sync Server) -> Result[&Stream, Error]
     c.err_clear_error()
+
+    of.gate.seal()
 
     val ssl = c.ssl_new(of.ctx)
 

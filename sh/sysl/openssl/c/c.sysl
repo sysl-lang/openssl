@@ -216,6 +216,33 @@ extern "SSL_CTX_set_alpn_select_cb" ctx_set_alpn_select_cb(ctx: *SslCtx,
 // What was agreed. **Answers a zero length rather than failing** when nothing was.
 extern "SSL_get0_alpn_selected" ssl_get0_alpn_selected(ssl: *Ssl, data: **u8, len: *u32)
 
+// ## Resuming a session
+//
+// A session is what a finished handshake leaves behind that a later one can start from. **It is
+// reference-counted inside OpenSSL, atomically**, so `SSL_get1_session` hands back a reference the
+// caller owes an `SSL_SESSION_free`, and `SSL_set_session` takes one of its own.
+opaque struct SslSession
+
+extern "SSL_get1_session" ssl_get1_session(ssl: *Ssl) -> *SslSession
+extern "SSL_set_session" ssl_set_session(ssl: *Ssl, session: *SslSession) -> i32
+extern "SSL_SESSION_free" session_free(session: *SslSession)
+
+// **A TLS 1.3 client's session is not resumable until a ticket has arrived**, which happens after
+// the handshake, so this is the question that says whether keeping one is worth anything.
+extern "SSL_SESSION_is_resumable" session_is_resumable(session: *SslSession) -> i32
+extern "SSL_session_reused" ssl_session_reused(ssl: *Ssl) -> i32
+
+// Whether a connection has begun its handshake yet (1 if not), and which end it is.
+extern "SSL_in_before" ssl_in_before(ssl: *Ssl) -> i32
+extern "SSL_is_server" ssl_is_server(ssl: *Ssl) -> i32
+
+// The server's side of resumption: which sessions it remembers (`SSL_CTX_ctrl` with the cache
+// commands below), what it calls itself, and whether it issues stateless tickets at all.
+extern "SSL_CTX_set_session_id_context" ctx_set_session_id_context(ctx: *SslCtx, id: *u8, len: u32) -> i32
+extern "SSL_CTX_set_options" ctx_set_options(ctx: *SslCtx, op: u64) -> u64
+extern "SSL_CTX_clear_options" ctx_clear_options(ctx: *SslCtx, op: u64) -> u64
+extern "SSL_CTX_get_options" ctx_get_options(ctx: *SslCtx) -> u64
+
 // ## Signing and verifying a digest
 //
 // The EVP tier rather than the RSA and EC ones, so that one pair of calls covers every key type and
@@ -284,6 +311,15 @@ c const
     SSL_TLSEXT_ERR_OK: i32 = "SSL_TLSEXT_ERR_OK"
     SSL_TLSEXT_ERR_ALERT_FATAL: i32 = "SSL_TLSEXT_ERR_ALERT_FATAL"
     SSL_TLSEXT_ERR_NOACK: i32 = "SSL_TLSEXT_ERR_NOACK"
+
+    // What the session `ctrl` commands expand to, so resumption needs no macro either.
+    SSL_CTRL_SET_SESS_CACHE_SIZE: i32 = "SSL_CTRL_SET_SESS_CACHE_SIZE"
+    SSL_CTRL_SET_SESS_CACHE_MODE: i32 = "SSL_CTRL_SET_SESS_CACHE_MODE"
+    SSL_CTRL_SET_TLSEXT_TICKET_KEYS: i32 = "SSL_CTRL_SET_TLSEXT_TICKET_KEYS"
+    SSL_SESS_CACHE_OFF: i64 = "SSL_SESS_CACHE_OFF"
+    SSL_SESS_CACHE_SERVER: i64 = "SSL_SESS_CACHE_SERVER"
+    SSL_MAX_SID_CTX_LENGTH: usize = "SSL_MAX_SID_CTX_LENGTH"
+    SSL_OP_NO_TICKET: u64 = "SSL_OP_NO_TICKET"
 
     // Key families, as NIDs. **`RSA_PSS` is a different one from `RSA`** -- a key generated as
     // RSASSA-PSS refuses PKCS#1 v1.5 signing outright.
