@@ -372,7 +372,30 @@ sudo pacman -S openssl          # Arch
 
 ## Testing
 
-`sysl test .` — 94 tests, **none of which needs a network.**
+`sysl test .` — 197 tests, **none of which needs a network.**
+
+**The primitives are checked against the documents that define them, not against the `openssl`
+command** — two views of one library agree with each other's mistakes.
+
+| what | checked against |
+|---|---|
+| SHA-1, SHA-224, SHA-256, SHA-384, SHA-512 | FIPS 180's examples: `abc`, the two-block messages, the empty message, and a million `a`s fed a thousand at a time |
+| HMAC | RFC 4231's seven cases under all four SHA-2 digests; RFC 2202 for SHA-1 |
+| HKDF | RFC 5869's seven cases, with the pseudorandom key checked as well as the output; over SHA-224/384/512, the RFC's definition computed from `hmac` |
+| AES-GCM | the GCM specification's test cases 1–4 (128-bit) and 13–16 (256-bit) |
+| ChaCha20-Poly1305 | RFC 8439 section 2.8.2 |
+| Ed25519 | RFC 8032 section 7.1, tests 1, 2, 3 and SHA(abc): signing reproduces each signature byte for byte |
+| ECDSA | RFC 6979 A.2.5 and A.2.6: the RFC's P-256 and P-384 signatures verify, its private scalars derive its public points, and signatures made with its private keys verify under its public ones |
+| RSA | RFC 7515 A.2: the RFC's RS256 signature verifies and signing reproduces it; PSS by sign-then-verify |
+| key encodings | RFC 8410's wrapping of RFC 8032's key, and RFC 5480 / RFC 5915 wrappings of RFC 6979's, written out by hand |
+
+**Every vector is shown able to fail.** One bit of the key, the nonce, the associated data, the
+ciphertext, the tag, the message or the signature — every byte of it, for a sealed message and for an
+RSA or Ed25519 signature — and the test asserts the answer changes. The binding itself was then broken
+on purpose, one argument at a time (the associated data left out of sealing, and of opening; the salt
+or the info dropped from HKDF; the key's length ignored by HMAC; a digest wired to another's name;
+the tag check skipped; PSS padding left off; the curve check loosened; the trailing-bytes check
+removed), and each break turned a test red.
 
 The sharing tests run one `Client` and one `Server` through eight threads handshaking at once, a
 context whose every name is gone before its streams' handshake, and the seal at both ends, including
@@ -409,3 +432,19 @@ than assumed.
 
 A ticket-key rotation callback (see above for why there is none), client certificates, SNI callbacks on the server side, and building a key from a
 JWKS document's `n`/`e` or `x`/`y` rather than from PEM. None is hard; none has a consumer yet.
+
+Among the primitives, deliberately:
+
+- **Encrypted private keys**, read or written. A passphrase prompt is not something a library does,
+  and a passphrase argument has no consumer.
+- **Streaming authenticated encryption.** Releasing plaintext before the tag has checked is the
+  mistake an AEAD exists to prevent; a message too large for memory wants a chunked construction
+  with its own framing, which is a design of its own.
+- **Nonces and tags of other lengths**, AES-192-GCM, AES-CCM, AES-GCM-SIV and XChaCha20-Poly1305
+  (which OpenSSL does not have).
+- **Deterministic ECDSA** (RFC 6979). OpenSSL signs with a random nonce; its deterministic mode
+  arrived in 3.2 and is not in every OpenSSL 3 a distribution ships.
+- **Ed448, X25519 and ECDH, RSA encryption, DSA**, and SHA-3, SHA-512/256, MD5 and BLAKE2.
+- **PBKDF2, scrypt and Argon2.** A password is not HKDF's input, and the org's `password` package is
+  where stretching one lives.
+- **PSS with any salt length but the digest's**, and MGF1 over a different digest from the message's.

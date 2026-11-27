@@ -187,8 +187,14 @@ a_finished_hmac_is_spent()
 
     assert(h.finish().unwrap() == unhex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
         "two pieces did not make RFC 4231's case 2")
-    assert(h.update("more".bytes).is_err(), "a finished HMAC took more")
-    assert(h.finish().is_err(), "an HMAC was finished twice")
+    // Refused here, before OpenSSL is asked: an error with no OpenSSL code is this package's own.
+    val more = h.update("more".bytes)
+    val again = h.finish()
+
+    assert(more.is_err(), "a finished HMAC took more")
+    assert(again.is_err(), "an HMAC was finished twice")
+    assert_eq(more.unwrap_err().code, 0)
+    assert_eq(again.unwrap_err().code, 0)
 
 @test
 the_key_is_copied_when_the_hmac_begins()

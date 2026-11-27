@@ -173,8 +173,15 @@ a_finished_hasher_is_spent()
     h.update("abc".bytes).unwrap()
     h.finish().unwrap()
 
-    assert(h.update("abc".bytes).is_err(), "a finished hasher took more")
-    assert(h.finish().is_err(), "a hasher was finished twice")
+    // **Refused here, before OpenSSL is asked**: an error with no OpenSSL code is this package's own,
+    // which holds on an OpenSSL that would have taken the bytes.
+    val more = h.update("abc".bytes)
+    val again = h.finish()
+
+    assert(more.is_err(), "a finished hasher took more")
+    assert(again.is_err(), "a hasher was finished twice")
+    assert_eq(more.unwrap_err().code, 0)
+    assert_eq(again.unwrap_err().code, 0)
 
 @test
 the_sizes_are_the_ones_openssl_gives()
