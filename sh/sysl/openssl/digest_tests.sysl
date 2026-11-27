@@ -1,0 +1,226 @@
+// The digests, against FIPS 180's own examples.
+//
+// **Every expected value here is one the standard prints** -- the one-block message `abc`, the
+// two-block messages, the empty message and the million `a`s -- so a wrong algorithm behind a name,
+// a truncated answer or a dropped piece each fail against a number nobody here chose. The million
+// `a`s are fed a thousand at a time, which is what makes them the streaming test: the one-shot call
+// never sees them.
+
+module sh.sysl.openssl
+@tests
+
+import sh.sysl.openssl.c
+import sysl.harness.*
+import sysl.buf.{Buf, buf, buf_filled}
+
+// -- what every vector file here reads its numbers with -------------------------------------------------
+
+private nibble(ch: u8) -> u8
+    if ch >= u8('0') && ch <= u8('9') then return ch - u8('0')
+
+    if ch >= u8('a') && ch <= u8('f') then return ch - u8('a') + 10
+
+    if ch >= u8('A') && ch <= u8('F') then return ch - u8('A') + 10
+
+    panic("a vector holds a character that is not a hex digit")
+end nibble
+
+// The bytes a run of hex digits spells. Spaces and line breaks are skipped, so a vector can be laid
+// out the way its standard prints it.
+private[openssl] unhex(text: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    var high: u8 = 0
+    var half = false
+
+    for ch in text.bytes
+        if ch == u8(' ') || ch == u8('\n') then continue
+
+        if half
+            out.push(high * 16 + nibble(ch))
+            half = false
+        else
+            high = nibble(ch)
+            half = true
+    end for
+
+    assert(!half, "a vector holds an odd number of hex digits")
+
+    out
+end unhex
+
+// `bytes` with one bit of the byte at `at` turned over: the smallest change there is.
+private[openssl] flipped(bytes: []const u8, at: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    out.extend(bytes)
+    out[at] = out[at] ^ 1
+
+    out
+end flipped
+
+private two_blocks() -> string = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+
+private two_long_blocks() -> string =
+    "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"
+
+private check(of: Digest, message: string, want: string)
+    val made = digest(of, message.bytes).unwrap()
+
+    assert(made == unhex(want), s"the digest of `${message}` is not the one FIPS 180 prints")
+end check
+
+// -- FIPS 180's examples ------------------------------------------------------------------------------
+
+@test
+sha1_of_the_standards_messages()
+    check(Sha1, "abc", "a9993e364706816aba3e25717850c26c9cd0d89d")
+    check(Sha1, two_blocks(), "84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+    check(Sha1, "", "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+
+@test
+sha224_of_the_standards_messages()
+    check(Sha224, "abc", "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7")
+    check(Sha224, two_blocks(), "75388b16512776cc5dba5da1fd890150b0c6455cb4f58b1952522525")
+    check(Sha224, "", "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f")
+
+@test
+sha256_of_the_standards_messages()
+    check(Sha256, "abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    check(Sha256, two_blocks(), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+    check(Sha256, "", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+
+@test
+sha384_of_the_standards_messages()
+    check(Sha384, "abc",
+        "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7")
+    check(Sha384, two_long_blocks(),
+        "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039")
+    check(Sha384, "",
+        "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b")
+
+@test
+sha512_of_the_standards_messages()
+    check(Sha512, "abc",
+        "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+    check(Sha512, two_long_blocks(),
+        "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909")
+    check(Sha512, "",
+        "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e")
+
+@test
+one_changed_bit_changes_the_digest()
+    // **The vectors can fail**: the same call over a message one bit away answers something else.
+    val near = flipped("abc".bytes, 0)
+
+    assert(digest(Sha256, near.view()).unwrap() !=
+        unhex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        "a different message has the digest of `abc`")
+    assert(digest(Sha384, "abc".bytes).unwrap() != digest(Sha384, near.view()).unwrap(), "SHA-384 ignored a bit")
+    assert(digest(Sha224, "abc".bytes).unwrap() != digest(Sha224, near.view()).unwrap(), "SHA-224 ignored a bit")
+
+// -- a piece at a time --------------------------------------------------------------------------------
+
+// The digest of a million `a`s, a thousand at a time.
+private million(of: Digest) -> Buf[u8]
+    val piece = buf_filled(1000, u8('a'))
+    val h = hasher(of).unwrap()
+
+    for i in 0..<1000
+        h.update(piece.view()).unwrap()
+
+    h.finish().unwrap()
+end million
+
+@test
+a_million_as_a_thousand_at_a_time()
+    assert(million(Sha1) == unhex("34aa973cd4c4daa4f61eeb2bdbad27316534016f"), "SHA-1")
+    assert(million(Sha224) == unhex("20794655980c91d8bbb4c1ea97618a4bf03f42581948b2ee4ee7ad67"), "SHA-224")
+    assert(million(Sha256) == unhex("cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"), "SHA-256")
+    assert(million(Sha384) ==
+        unhex("9d0e1809716474cb086e834e310a4a1ced149e9c00f248527972cec5704c2a5b07b8b3dc38ecc4ebae97ddd87f3d8985"),
+        "SHA-384")
+    assert(million(Sha512) ==
+        unhex("e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973ebde0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b"),
+        "SHA-512")
+
+@test
+every_split_of_a_message_gives_the_one_shot_digest()
+    val message = two_long_blocks().bytes
+    val whole = digest(Sha384, message).unwrap()
+
+    for cut in 0..<(message.len + 1)
+        val h = hasher(Sha384).unwrap()
+
+        h.update(message[0..<cut]).unwrap()
+        h.update(message[cut..<message.len]).unwrap()
+
+        assert(h.finish().unwrap() == whole, s"splitting at ${cut} changed the digest")
+    end for
+
+@test
+a_hasher_fed_nothing_answers_the_empty_digest()
+    val h = hasher(Sha224).unwrap()
+
+    h.update("".bytes).unwrap()
+
+    assert(h.finish().unwrap() == unhex("d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"),
+        "the digest of nothing fed is not the digest of the empty message")
+
+@test
+a_finished_hasher_is_spent()
+    val h = hasher(Sha256).unwrap()
+
+    h.update("abc".bytes).unwrap()
+    h.finish().unwrap()
+
+    assert(h.update("abc".bytes).is_err(), "a finished hasher took more")
+    assert(h.finish().is_err(), "a hasher was finished twice")
+
+@test
+the_sizes_are_the_ones_openssl_gives()
+    val all = [Sha1, Sha224, Sha256, Sha384, Sha512]
+
+    for of in all
+        assert_eq(digest_size(of), usize(c.md_size(md_of(of))))
+        assert_eq(digest(of, "abc".bytes).unwrap().len(), digest_size(of))
+    end for
+
+// -- memory -------------------------------------------------------------------------------------------
+
+@test
+equal_is_equality()
+    val a = unhex("000102030405060708090a0b0c0d0e0f")
+
+    assert(equal(a.view(), a.view()), "a string is not equal to itself")
+    assert(equal("".bytes, "".bytes), "two empty strings differ")
+
+    // Every single-bit neighbour differs, the last byte included: a comparison that stopped a byte
+    // short would pass the others.
+    for i in 0..<a.len()
+        assert(!equal(a.view(), flipped(a.view(), i).view()), s"a difference at byte ${i} went unseen")
+
+    assert(!equal(a.view(), a.view()[0..<15]), "a prefix compared equal")
+    assert(!equal("".bytes, a.view()), "nothing compared equal to something")
+
+@test
+wipe_leaves_zeros()
+    var secret = unhex("deadbeefcafef00d")
+
+    wipe(secret.view_mut())
+
+    assert_eq(secret.len(), 8)
+
+    for i in 0..<secret.len()
+        assert_eq(secret[i], 0)
+
+    var none: Buf[u8] = buf()
+
+    wipe(none.view_mut())
+
+@test
+a_parameter_is_laid_out_as_openssl_lays_it_out()
+    // **What licenses declaring `OSSL_PARAM` field by field**: the size, and where the two fields
+    // after the padding fall.
+    assert_eq(sizeof(c.OsslParam), c.OSSL_PARAM_SIZE)
+    assert_eq(offsetof(c.OsslParam, data), c.OSSL_PARAM_DATA_OFFSET)
+    assert_eq(offsetof(c.OsslParam, return_size), c.OSSL_PARAM_RETURN_SIZE_OFFSET)

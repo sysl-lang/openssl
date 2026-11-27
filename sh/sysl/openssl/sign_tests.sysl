@@ -394,3 +394,137 @@ der_that_is_not_an_ecdsa_signature_is_refused()
     val wide = der_of("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".bytes, 48)
 
     assert(raw_of(wide.view(), 32).is_none(), "a P-384 signature was read as a P-256 one")
+
+// -- the RFC's keys, through everything else the package does with a key ---------------------------------
+
+@test
+the_rfcs_rs256_signature_checks_out_through_the_der_calls_too()
+    // For RSA the two pairs of calls take and give the same bytes.
+    val pub = public_key(rfc_rsa_public().bytes).unwrap()
+    val priv = private_key(rfc_rsa_private().bytes).unwrap()
+    val sig = unbase64(rfc_rs256_signature())
+
+    assert(verify_der(pub, Rs256, rfc_input_rs().bytes, sig.view()).unwrap(), "RFC 7515 A.2's signature did not check out")
+    assert(sign_der(priv, Rs256, rfc_input_rs().bytes).unwrap() == sig, "signing RFC 7515 A.2's input produced a different signature")
+
+@test
+every_byte_of_an_rsa_signature_and_of_its_message_matters()
+    // **The known signature can fail**: one bit anywhere in its 256 bytes, or in what it signs.
+    val pub = public_key(rfc_rsa_public().bytes).unwrap()
+    val sig = unbase64(rfc_rs256_signature())
+    val input = rfc_input_rs().bytes
+
+    for i in 0..<sig.len()
+        assert_eq(verify(pub, Rs256, input, flipped(sig.view(), i).view()).unwrap_or(false), false)
+
+    for i in [0, input.len / 2, input.len - 1]
+        assert_eq(verify(pub, Rs256, flipped(input, i).view(), sig.view()).unwrap(), false)
+
+    // The digest and the padding are part of what was signed.
+    assert_eq(verify(pub, Rs384, input, sig.view()).unwrap(), false)
+    assert_eq(verify(pub, Rs512, input, sig.view()).unwrap(), false)
+    assert_eq(verify(pub, Ps256, input, sig.view()).unwrap(), false)
+
+@test
+an_rsa_signature_of_the_wrong_length_is_a_verdict_to_the_der_call()
+    val pub = public_key(rfc_rsa_public().bytes).unwrap()
+    val sig = unbase64(rfc_rs256_signature())
+    val input = rfc_input_rs().bytes
+
+    var long: Buf[u8] = buf()
+
+    long.extend(sig.view())
+    long.push(0)
+
+    assert_eq(verify_der(pub, Rs256, input, sig.view()[0..<255]).unwrap(), false)
+    assert_eq(verify_der(pub, Rs256, input, long.view()).unwrap(), false)
+    assert_eq(verify_der(pub, Ps256, input, sig.view()[0..<1]).unwrap(), false)
+    assert_eq(verify_der(pub, Rs256, input, "".bytes).unwrap(), false)
+
+@test
+every_rsa_algorithm_tells_a_changed_message_and_a_changed_signature()
+    val pub = public_key(rfc_rsa_public().bytes).unwrap()
+    val priv = private_key(rfc_rsa_private().bytes).unwrap()
+    val text = "the quick brown fox".bytes
+
+    for alg in [Algorithm.Rs256, Algorithm.Rs384, Algorithm.Rs512, Algorithm.Ps256, Algorithm.Ps384, Algorithm.Ps512]
+        val sig = sign_der(priv, alg, text).unwrap()
+
+        assert(verify_der(pub, alg, text, sig.view()).unwrap(), "a signature this file made did not check out")
+        assert_eq(verify_der(pub, alg, flipped(text, 18).view(), sig.view()).unwrap(), false)
+        assert_eq(verify_der(pub, alg, text, flipped(sig.view(), 255).view()).unwrap_or(false), false)
+        assert_eq(verify_der(pub, alg, text, flipped(sig.view(), 128).view()).unwrap_or(false), false)
+    end for
+
+@test
+pss_signatures_differ_and_pkcs1_signatures_do_not()
+    val priv = private_key(rfc_rsa_private().bytes).unwrap()
+    val text = "the quick brown fox".bytes
+
+    assert(sign(priv, Ps256, text).unwrap() != sign(priv, Ps256, text).unwrap(), "two PSS signatures share a salt")
+    assert(sign(priv, Rs384, text).unwrap() == sign(priv, Rs384, text).unwrap(), "PKCS#1 v1.5 signed one message two ways")
+
+@test
+the_rfcs_keys_are_the_kinds_they_are()
+    assert_eq(kind_name(public_key(rfc_rsa_public().bytes).unwrap().kind()), "rsa-2048")
+    assert_eq(kind_name(private_key(rfc_rsa_private().bytes).unwrap().kind()), "rsa-2048")
+    assert_eq(kind_name(public_key(rfc_ec_public().bytes).unwrap().kind()), "p-256")
+    assert_eq(kind_name(private_key(p384_private().bytes).unwrap().kind()), "p-384")
+    assert_eq(kind_name(public_key(p521_public().bytes).unwrap().kind()), "p-521")
+
+@test
+a_key_is_written_as_the_pem_it_was_read_from()
+    // **The fixtures are PEM somebody else wrote**, so writing a key back out and getting the same
+    // text checks the writer against them rather than against the reader.
+    assert(private_key(rfc_rsa_private().bytes).unwrap().pem().unwrap().view() == rfc_rsa_private().bytes,
+        "the RSA private key was written differently")
+    assert(public_key(rfc_rsa_public().bytes).unwrap().pem().unwrap().view() == rfc_rsa_public().bytes,
+        "the RSA public key was written differently")
+    assert(public_key(p384_public().bytes).unwrap().pem().unwrap().view() == p384_public().bytes,
+        "the P-384 public key was written differently")
+    assert(private_key(p521_private().bytes).unwrap().pem().unwrap().view() == p521_private().bytes,
+        "the P-521 private key was written differently")
+
+@test
+the_public_half_of_a_private_key_is_the_public_key_beside_it()
+    val from_private = private_key(rfc_rsa_private().bytes).unwrap().public_key().unwrap()
+    val beside = public_key(rfc_rsa_public().bytes).unwrap()
+
+    assert(from_private.der().unwrap() == beside.der().unwrap(), "the RSA public half is another key")
+    assert(from_private.pem().unwrap().view() == rfc_rsa_public().bytes, "the RSA public half is written differently")
+
+    val ec = private_key(rfc_ec_private().bytes).unwrap().public_key().unwrap()
+
+    assert(ec.pem().unwrap().view() == rfc_ec_public().bytes, "the P-256 public half is another key")
+
+    // And it verifies what the private key signs, which is the point of having it.
+    val sig = unbase64(rfc_rs256_signature())
+
+    assert(verify(from_private, Rs256, rfc_input_rs().bytes, sig.view()).unwrap(), "the public half did not check RFC 7515 A.2's signature")
+
+@test
+an_rsa_key_reads_from_der_as_from_pem()
+    val priv = private_key(rfc_rsa_private().bytes).unwrap()
+    val der = priv.der().unwrap()
+    val again = private_key_der(der.view()).unwrap()
+
+    // Deterministic, so the same key signs the RFC's input to the RFC's signature.
+    assert(sign(again, Rs256, rfc_input_rs().bytes).unwrap() == unbase64(rfc_rs256_signature()),
+        "the key read from DER signed differently")
+
+    val pub_der = public_key(rfc_rsa_public().bytes).unwrap().der().unwrap()
+
+    assert(verify(public_key_der(pub_der.view()).unwrap(), Rs256, rfc_input_rs().bytes, unbase64(rfc_rs256_signature()).view()).unwrap(),
+        "the public key read from DER did not check the RFC's signature")
+
+@test
+a_p384_key_is_not_one_es256_is_about()
+    // **RFC 7518 fixes the curve of each `ES` algorithm.** A P-384 key under ES256 is the wrong
+    // JWKS entry wired to it, not a forgery.
+    val priv = private_key(p384_private().bytes).unwrap()
+    val pub = public_key(p384_public().bytes).unwrap()
+    var sig: [64]u8
+
+    assert(sign(priv, Es256, "x".bytes).is_err(), "a P-384 key signed ES256")
+    assert(verify(pub, Es256, "x".bytes, sig[0..<64]).is_err(), "a P-384 key checked ES256")
+    assert(sign(priv, Es384, "x".bytes).is_ok(), "a P-384 key would not sign ES384")

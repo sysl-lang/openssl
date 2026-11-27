@@ -1,0 +1,374 @@
+// Keys: read from PEM, DER or raw bytes, written back out the same ways, and made new.
+//
+// **A key is a handle, and the encodings are views of it.** A `PublicKey` or a `PrivateKey` is one
+// parsed `EVP_PKEY` that OpenSSL frees when the last holder lets go; reading the same key from PEM,
+// from DER or (for Ed25519) from its 32 raw bytes gives the same thing, and each can be written back
+// in any of them.
+//
+// **The encodings written are the two that everything reads**: SubjectPublicKeyInfo for a public
+// key (`BEGIN PUBLIC KEY`) and unencrypted PKCS#8 for a private one (`BEGIN PRIVATE KEY`). The
+// traditional forms (`BEGIN RSA PRIVATE KEY`, `BEGIN EC PRIVATE KEY`) are read and never written.
+//
+// **This package reads what OpenSSL reads and leaves policy to its caller.** A 1024-bit RSA key
+// parses, and `kind` says it is 1024 bits; whether to use it is a decision for whoever knows what
+// the key is for.
+
+module sh.sysl.openssl
+
+import sh.sysl.openssl.c
+import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.raw.ptr_cast
+import sysl.text.{cstring, from_cstring}
+import sysl.buf.{Buf, buf_filled}
+
+// What a key is.
+enum KeyKind
+    // An RSA key, and its modulus in bits.
+    Rsa(bits: i32)
+
+    // An RSA key restricted to RSASSA-PSS, which signs with the `Ps` algorithms and no others.
+    RsaPss(bits: i32)
+
+    // An elliptic-curve key on NIST P-256, P-384 or P-521.
+    EcP256
+    EcP384
+    EcP521
+
+    Ed25519
+
+    // A key OpenSSL read and this package signs nothing with: another curve, Ed448, X25519, DSA.
+    Other
+end KeyKind
+
+private no_pkey() -> *c.EvpPkey = ptr_cast(0usize)
+
+private[openssl] kind_of(p: *c.EvpPkey) -> KeyKind
+    val id = c.pkey_base_id(p)
+
+    if id == c.EVP_PKEY_ED25519 then return KeyKind.Ed25519
+
+    if id == c.EVP_PKEY_RSA then return KeyKind.Rsa(c.pkey_bits(p))
+
+    if id == c.EVP_PKEY_RSA_PSS then return KeyKind.RsaPss(c.pkey_bits(p))
+
+    if id != c.EVP_PKEY_EC then return KeyKind.Other
+
+    var name: [80]u8
+    var len: usize = 0
+
+    name[0] = 0
+
+    if c.pkey_group_name(p, &name[0], 80, &len) != 1
+        c.err_clear_error()
+
+        return KeyKind.Other
+    end if
+
+    from_cstring(&name[0]) match
+        Ok(curve) ->
+            if curve == "prime256v1" then KeyKind.EcP256
+            else if curve == "secp384r1" then KeyKind.EcP384
+            else if curve == "secp521r1" then KeyKind.EcP521
+            else KeyKind.Other
+        Err(_) -> KeyKind.Other
+end kind_of
+
+// -- the handles ------------------------------------------------------------------------------------
+
+// A key that can check a signature.
+struct PublicKey
+    private[openssl] key: *c.EvpPkey
+
+    kind(&self) -> KeyKind = kind_of(self.key)
+
+    // The key as DER: a SubjectPublicKeyInfo.
+    der(&self) -> Result[Buf[u8], Error] = written(self.key, Encoding.SpkiDer)
+
+    // The key as PEM: a `BEGIN PUBLIC KEY` block.
+    pem(&self) -> Result[Buf[u8], Error] = written(self.key, Encoding.SpkiPem)
+
+    // An Ed25519 key as its 32 bytes (RFC 8032's encoding). No other kind of key has a raw form.
+    raw(&self) -> Result[Buf[u8], Error] = raw_of_key(self.key, false)
+end PublicKey
+
+impl Drop for PublicKey
+    drop(self) = c.pkey_free(self.key)
+
+// A key that can make one.
+//
+// **Every encoding of it is the secret.** What `der`, `pem` and `raw` answer is the caller's to
+// `wipe` when it is done with it; OpenSSL wipes its own copy when the key is dropped.
+struct PrivateKey
+    private[openssl] key: *c.EvpPkey
+
+    kind(&self) -> KeyKind = kind_of(self.key)
+
+    // The key as DER: an unencrypted PKCS#8 `PrivateKeyInfo`.
+    der(&self) -> Result[Buf[u8], Error] = written(self.key, Encoding.Pkcs8Der)
+
+    // The key as PEM: an unencrypted `BEGIN PRIVATE KEY` block.
+    pem(&self) -> Result[Buf[u8], Error] = written(self.key, Encoding.Pkcs8Pem)
+
+    // An Ed25519 key as its 32-byte seed (RFC 8032's secret key). No other kind of key has a raw
+    // form.
+    raw(&self) -> Result[Buf[u8], Error] = raw_of_key(self.key, true)
+
+    // The public half, as a key of its own.
+    //
+    // **Its own, and not this one seen through a narrower type**: it is rebuilt from the public
+    // encoding, so nothing reachable from the answer holds the private half.
+    public_key(&self) -> Result[&PublicKey, Error]
+        var spki = written(self.key, Encoding.SpkiDer)?
+
+        public_key_der(spki.view())
+    end public_key
+end PrivateKey
+
+impl Drop for PrivateKey
+    drop(self) = c.pkey_free(self.key)
+
+// -- reading ----------------------------------------------------------------------------------------
+
+// Read a public key from PEM -- a `BEGIN PUBLIC KEY` block, which is SubjectPublicKeyInfo.
+//
+// **Not a certificate.** A certificate carries a public key inside it and is a different object;
+// this reads the key on its own, which is what a JWKS endpoint's PEM form and an `openssl pkey -pubout`
+// both produce.
+public_key(pem: []const u8) -> Result[&PublicKey, Error]
+    read(pem, true) match
+        Ok(k) -> Ok(PublicKey(k))
+        Err(e) -> Err(e)
+end public_key
+
+// Read a private key from PEM -- a `BEGIN PRIVATE KEY` block.
+//
+// **An encrypted key is refused rather than prompted for.** The passphrase callback is left null,
+// which makes OpenSSL try an empty one and fail, instead of reading a terminal a server has no
+// business touching.
+private_key(pem: []const u8) -> Result[&PrivateKey, Error]
+    read(pem, false) match
+        Ok(k) -> Ok(PrivateKey(k))
+        Err(e) -> Err(e)
+end private_key
+
+private read(pem: []const u8, public: bool) -> Result[*c.EvpPkey, Error]
+    if pem.len == 0 then return Err(Error(c.SSL_ERROR_SSL, 0, "there was no key in those bytes", 0))
+
+    c.err_clear_error()
+
+    val bio = c.bio_new_mem_buf(as_ptr(pem), i32(pem.len))
+
+    if bio == null then return Err(fail(c.SSL_ERROR_SSL, "could not read the key"))
+
+    val key = if public
+        c.pem_read_bio_pubkey(bio, null, null, null)
+    else
+        c.pem_read_bio_private_key(bio, null, null, null)
+
+    c.bio_free(bio)
+
+    if key == null then return Err(fail(c.SSL_ERROR_SSL, "there was no key in those bytes"))
+
+    Ok(key)
+end read
+
+// Read a public key from DER: a SubjectPublicKeyInfo, **and nothing after it**. DER has no
+// terminator, so bytes left over are a different input from the one that was parsed, and are
+// refused.
+public_key_der(der: []const u8) -> Result[&PublicKey, Error]
+    if der.len == 0 then return Err(refused("there was no key in those bytes"))
+
+    c.err_clear_error()
+
+    val start = as_ptr(der)
+    var at = start
+    val key = c.d2i_pubkey(null, &at, i64(der.len))
+
+    if key == null then return Err(fail(c.SSL_ERROR_SSL, "those bytes are not a public key (SubjectPublicKeyInfo) in DER"))
+
+    if usize(at) != usize(start) + der.len
+        c.pkey_free(key)
+
+        return Err(refused("bytes follow the public key"))
+    end if
+
+    Ok(PublicKey(key))
+end public_key_der
+
+// Read a private key from DER: unencrypted PKCS#8, or the traditional RSA or EC form, and nothing
+// after it.
+private_key_der(der: []const u8) -> Result[&PrivateKey, Error]
+    if der.len == 0 then return Err(refused("there was no key in those bytes"))
+
+    c.err_clear_error()
+
+    val start = as_ptr(der)
+    var at = start
+    val key = c.d2i_auto_private_key(null, &at, i64(der.len))
+
+    if key == null then return Err(fail(c.SSL_ERROR_SSL, "those bytes are not an unencrypted private key in DER"))
+
+    if usize(at) != usize(start) + der.len
+        c.pkey_free(key)
+
+        return Err(refused("bytes follow the private key"))
+    end if
+
+    Ok(PrivateKey(key))
+end private_key_der
+
+// The Ed25519 public key whose 32 bytes are `raw` (RFC 8032's encoding).
+ed25519_public_key(raw: []const u8) -> Result[&PublicKey, Error]
+    if raw.len != 32 then return Err(refused(s"an Ed25519 public key is 32 bytes, and these are ${raw.len}"))
+
+    c.err_clear_error()
+
+    val key = c.pkey_new_raw_public_key(c.EVP_PKEY_ED25519, null, as_ptr(raw), 32)
+
+    if key == null then return Err(fail(c.SSL_ERROR_SSL, "those bytes are not an Ed25519 public key"))
+
+    Ok(PublicKey(key))
+end ed25519_public_key
+
+// The Ed25519 private key whose 32-byte seed is `seed` (RFC 8032's secret key). Every 32 bytes is
+// a seed.
+ed25519_private_key(seed: []const u8) -> Result[&PrivateKey, Error]
+    if seed.len != 32 then return Err(refused(s"an Ed25519 private key is 32 bytes, and these are ${seed.len}"))
+
+    c.err_clear_error()
+
+    val key = c.pkey_new_raw_private_key(c.EVP_PKEY_ED25519, null, as_ptr(seed), 32)
+
+    if key == null then return Err(fail(c.SSL_ERROR_SSL, "the Ed25519 private key could not be made"))
+
+    Ok(PrivateKey(key))
+end ed25519_private_key
+
+// -- writing ----------------------------------------------------------------------------------------
+
+private enum Encoding
+    SpkiDer
+    SpkiPem
+    Pkcs8Der
+    Pkcs8Pem
+end Encoding
+
+// **Through a memory `BIO`, whichever encoding it is**, so there is one way of taking the bytes
+// back out. Freeing the `BIO` clears what it held, which matters for the private two.
+private written(key: *c.EvpPkey, how: Encoding) -> Result[Buf[u8], Error]
+    c.err_clear_error()
+
+    val bio = c.bio_new(c.bio_s_mem())
+
+    if bio == null then return Err(fail(c.SSL_ERROR_SSL, "could not write the key"))
+
+    val rc = how match
+        SpkiDer -> c.i2d_pubkey_bio(bio, key)
+        SpkiPem -> c.pem_write_bio_pubkey(bio, key)
+        Pkcs8Der -> c.i2d_pkcs8_private_key_bio(bio, key, null, null, 0, null, null)
+        Pkcs8Pem -> c.pem_write_bio_pkcs8_private_key(bio, key, null, null, 0, null, null)
+
+    val size = c.bio_ctrl_pending(bio)
+
+    if rc != 1 || size == 0 || size > 0x7fffffff
+        val why = fail(c.SSL_ERROR_SSL, "the key could not be written")
+
+        c.bio_free(bio)
+
+        return Err(why)
+    end if
+
+    var out = buf_filled(size, u8(0))
+    val got = c.bio_read(bio, as_mut_ptr(out.view_mut()), i32(size))
+
+    c.bio_free(bio)
+
+    if got != i32(size)
+        wipe(out.view_mut())
+
+        return Err(refused("the key could not be written"))
+    end if
+
+    Ok(out)
+end written
+
+private raw_of_key(key: *c.EvpPkey, private_half: bool) -> Result[Buf[u8], Error]
+    kind_of(key) match
+        Ed25519 -> ()
+        else return Err(refused("only an Ed25519 key has a raw form"))
+
+    c.err_clear_error()
+
+    var out = buf_filled(32, u8(0))
+    var len: usize = 32
+
+    val rc = if private_half
+        c.pkey_get_raw_private_key(key, as_mut_ptr(out.view_mut()), &len)
+    else
+        c.pkey_get_raw_public_key(key, as_mut_ptr(out.view_mut()), &len)
+
+    if rc != 1 || len != 32
+        wipe(out.view_mut())
+
+        return Err(fail(c.SSL_ERROR_SSL, "the key's raw form could not be read"))
+    end if
+
+    Ok(out)
+end raw_of_key
+
+// -- making -----------------------------------------------------------------------------------------
+
+// A new private key of `kind`, from the operating system's randomness through OpenSSL's generator.
+//
+// **An RSA key is 2048 to 16384 bits.** Anything smaller is no longer a key worth making, and
+// anything larger takes minutes to make and is past what its peers accept. `RsaPss` and `Other`
+// are kinds that are read, not made.
+generate_key(kind: KeyKind) -> Result[&PrivateKey, Error]
+    val algorithm = kind match
+        Ed25519 -> "ED25519"
+        Rsa(bits) ->
+            if bits < 2048 || bits > 16384
+                return Err(refused(s"an RSA key of ${bits} bits is not made: the sizes made are 2048 to 16384 bits"))
+
+            "RSA"
+        EcP256 -> "EC"
+        EcP384 -> "EC"
+        EcP521 -> "EC"
+        else return Err(refused("that is a kind of key this package reads and does not make"))
+
+    c.err_clear_error()
+
+    val name = cstring(algorithm)
+    val ctx = c.pkey_ctx_new_from_name(null, name.ptr, null)
+
+    if ctx == null then return Err(fail(c.SSL_ERROR_SSL, "key generation could not begin"))
+
+    var ready = c.pkey_keygen_init(ctx)
+
+    if ready == 1
+        ready = kind match
+            EcP256 -> on_curve(ctx, "P-256")
+            EcP384 -> on_curve(ctx, "P-384")
+            EcP521 -> on_curve(ctx, "P-521")
+            Rsa(bits) -> c.pkey_ctx_set_rsa_keygen_bits(ctx, bits)
+            else 1
+    end if
+
+    var key = no_pkey()
+
+    if ready == 1 then ready = c.pkey_generate(ctx, &key)
+
+    val why = if ready != 1 || key == null then Some(fail(c.SSL_ERROR_SSL, "the key could not be generated")) else None
+
+    c.pkey_ctx_free(ctx)
+
+    why match
+        Some(e) -> Err(e)
+        None -> Ok(PrivateKey(key))
+end generate_key
+
+private on_curve(ctx: *c.EvpPkeyCtx, curve: string) -> i32
+    val name = cstring(curve)
+
+    c.pkey_ctx_set_group_name(ctx, name.ptr)
+end on_curve

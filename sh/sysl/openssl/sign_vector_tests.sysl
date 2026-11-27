@@ -1,0 +1,401 @@
+// Ed25519 against RFC 8032 and ECDSA against RFC 6979, in both forms a signature travels in.
+//
+// **Ed25519 is deterministic, so RFC 8032's section 7.1 is a known answer in both directions**:
+// signing the RFC's message with the RFC's key has to produce the RFC's 64 bytes, and they have to
+// verify. **ECDSA as OpenSSL signs it is randomised**, so RFC 6979's appendix A.2 is used the way
+// that still means something: its signatures, which nothing here produced, have to verify under its
+// public keys, and a signature made here with its private key has to verify under its public one.
+//
+// **Every vector is shown able to fail**: a bit of the message, of the signature, of the key.
+
+module sh.sysl.openssl
+@tests
+
+import sysl.harness.*
+import sysl.buf.{Buf, buf}
+
+// -- RFC 8032 section 7.1 -----------------------------------------------------------------------------
+
+private struct Ed
+    seed: string
+    public: string
+    message: string
+    signature: string
+end Ed
+
+private ed_1() -> Ed = Ed(ed_seed(), ed_public(), "", raw"""
+    e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155
+    5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b
+    """)
+
+private ed_2() -> Ed = Ed("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+    "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", "72", raw"""
+    92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da
+    085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00
+    """)
+
+private ed_3() -> Ed = Ed("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+    "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025", "af82", raw"""
+    6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac
+    18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a
+    """)
+
+// "TEST SHA(abc)": the message is the SHA-512 of `abc`.
+private ed_sha() -> Ed = Ed("833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42",
+    "ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf",
+    "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+    raw"""
+    dc2a4459e7369633a52b1bf277839a00201009a3efbf3ecb69bea2186c26b589
+    09351fc9ac90b3ecfdfbc7c66431e0303dca179c138ac17ad9bef1177331a704
+    """)
+
+private check_ed(v: Ed)
+    val key = ed25519_private_key(unhex(v.seed).view()).unwrap()
+    val public = ed25519_public_key(unhex(v.public).view()).unwrap()
+    val message = unhex(v.message)
+    val want = unhex(v.signature)
+
+    assert(key.public_key().unwrap().raw().unwrap() == unhex(v.public), "the public key is not the RFC's")
+    assert(sign(key, EdDsa, message.view()).unwrap() == want, "signing did not produce the RFC's signature")
+    assert(sign_der(key, EdDsa, message.view()).unwrap() == want, "an Ed25519 signature has one form, and this is another")
+    assert(verify(public, EdDsa, message.view(), want.view()).unwrap(), "the RFC's signature did not check out")
+    assert(verify_der(public, EdDsa, message.view(), want.view()).unwrap(), "the RFC's signature did not check out")
+end check_ed
+
+@test
+rfc_8032_test_1_the_empty_message()
+    check_ed(ed_1())
+
+@test
+rfc_8032_test_2_one_byte()
+    check_ed(ed_2())
+
+@test
+rfc_8032_test_3_two_bytes()
+    check_ed(ed_3())
+
+@test
+rfc_8032_test_sha_abc()
+    check_ed(ed_sha())
+
+@test
+an_ed25519_signature_with_anything_changed_does_not_check_out()
+    val v = ed_3()
+    val public = ed25519_public_key(unhex(v.public).view()).unwrap()
+    val message = unhex(v.message)
+    val sig = unhex(v.signature)
+
+    assert(verify(public, EdDsa, message.view(), sig.view()).unwrap(), "the untouched signature did not check out")
+
+    // Every byte of the signature, in both halves of it.
+    for i in 0..<64
+        assert_eq(verify(public, EdDsa, message.view(), flipped(sig.view(), i).view()).unwrap(), false)
+
+    assert_eq(verify(public, EdDsa, flipped(message.view(), 0).view(), sig.view()).unwrap(), false)
+    assert_eq(verify(public, EdDsa, flipped(message.view(), 1).view(), sig.view()).unwrap(), false)
+    assert_eq(verify(public, EdDsa, message.view()[0..<1], sig.view()).unwrap(), false)
+    assert_eq(verify(public, EdDsa, "".bytes, sig.view()).unwrap(), false)
+
+    // Another key: test 2's.
+    val other = ed25519_public_key(unhex(ed_2().public).view()).unwrap()
+
+    assert_eq(verify(other, EdDsa, message.view(), sig.view()).unwrap(), false)
+
+    // And a key one bit away, where those bytes are a key at all.
+    ed25519_public_key(flipped(unhex(v.public).view(), 0).view()) match
+        Ok(near) -> assert_eq(verify(near, EdDsa, message.view(), sig.view()).unwrap_or(false), false)
+        Err(_) -> ()
+
+@test
+an_ed25519_signature_of_the_wrong_length_is_an_error_to_jose_and_a_verdict_to_der()
+    val v = ed_2()
+    val public = ed25519_public_key(unhex(v.public).view()).unwrap()
+    val message = unhex(v.message)
+    val sig = unhex(v.signature)
+
+    var long: Buf[u8] = buf()
+
+    long.extend(sig.view())
+    long.push(0)
+
+    assert(verify(public, EdDsa, message.view(), sig.view()[0..<63]).is_err(), "63 bytes were checked as a signature")
+    assert(verify(public, EdDsa, message.view(), long.view()).is_err(), "65 bytes were checked as a signature")
+    assert(verify(public, EdDsa, message.view(), "".bytes).is_err(), "no bytes were checked as a signature")
+
+    assert_eq(verify_der(public, EdDsa, message.view(), sig.view()[0..<63]).unwrap(), false)
+    assert_eq(verify_der(public, EdDsa, message.view(), long.view()).unwrap(), false)
+    assert_eq(verify_der(public, EdDsa, message.view(), "".bytes).unwrap(), false)
+
+// -- RFC 6979 appendix A.2.5 and A.2.6 ----------------------------------------------------------------
+
+private struct Ec
+    alg: Algorithm
+    spki: Buf[u8]
+    pkcs8: Buf[u8]
+    message: string
+    r: string
+    s: string
+end Ec
+
+private p256_sample() -> Ec = Ec(Es256, p256_spki(), p256_pkcs8(), "sample",
+    "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716",
+    "f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8")
+
+private p256_test() -> Ec = Ec(Es256, p256_spki(), p256_pkcs8(), "test",
+    "f1abb023518351cd71d881567b1ea663ed3efcf6c5132b354f28d3b0b7d38367",
+    "019f4113742a2b14bd25926b49c649155f267e60d3814b4c0cc84250e46f0083")
+
+private p384_sample() -> Ec = Ec(Es384, p384_spki(), p384_pkcs8(), "sample",
+    "94edbb92a5ecb8aad4736e56c691916b3f88140666ce9fa73d64c4ea95ad133c81a648152e44acf96e36dd1e80fabe46",
+    "99ef4aeb15f178cea1fe40db2603138f130e740a19624526203b6351d0a3a94fa329c145786e679e7b82c71a38628ac8")
+
+private p384_test() -> Ec = Ec(Es384, p384_spki(), p384_pkcs8(), "test",
+    "8203b63d3c853e8d77227fb377bcf7b7b772e97892a80f36ab775d509d7a5feb0542a7f0812998da8f1dd3ca3cf023db",
+    "ddd0760448d42d8a43af45af836fce4de8be06b485e9b61b827c2f13173923e06a739f040649a667bf3b828246baa5a5")
+
+// The RFC's signature verifies in both forms, and a signature made here with the RFC's private key
+// verifies under the RFC's public key in both forms.
+private check_ec(v: Ec)
+    val public = public_key_der(v.spki.view()).unwrap()
+    val raw = joined(v.r, v.s)
+    val der = ecdsa_der(v.alg, raw.view()).unwrap()
+
+    assert(verify(public, v.alg, v.message.bytes, raw.view()).unwrap(), "the RFC's signature did not check out as r || s")
+    assert(verify_der(public, v.alg, v.message.bytes, der.view()).unwrap(), "the RFC's signature did not check out as DER")
+    assert(ecdsa_raw(v.alg, der.view()).unwrap() == raw, "the DER did not convert back to the RFC's r and s")
+
+    val key = private_key_der(v.pkcs8.view()).unwrap()
+    val made = sign(key, v.alg, v.message.bytes).unwrap()
+    val made_der = sign_der(key, v.alg, v.message.bytes).unwrap()
+
+    assert_eq(made.len(), raw.len())
+    assert(verify(public, v.alg, v.message.bytes, made.view()).unwrap(), "a signature made with the RFC's private key did not check out")
+    assert(verify_der(public, v.alg, v.message.bytes, made_der.view()).unwrap(), "a DER signature made with the RFC's private key did not check out")
+    assert(verify(public, v.alg, v.message.bytes, ecdsa_raw(v.alg, made_der.view()).unwrap().view()).unwrap(),
+        "a DER signature did not check out once converted")
+end check_ec
+
+// One bit of the message, of each coordinate, and of the key's point.
+private check_ec_can_fail(v: Ec)
+    val public = public_key_der(v.spki.view()).unwrap()
+    val raw = joined(v.r, v.s)
+    val n = raw.len() / 2
+    val message = v.message.bytes
+
+    assert(verify(public, v.alg, message, raw.view()).unwrap(), "the untouched signature did not check out")
+
+    for i in [0, n - 1, n, 2 * n - 1]
+        val bad = flipped(raw.view(), i)
+
+        assert_eq(verify(public, v.alg, message, bad.view()).unwrap(), false)
+        assert_eq(verify_der(public, v.alg, message, ecdsa_der(v.alg, bad.view()).unwrap().view()).unwrap(), false)
+    end for
+
+    assert_eq(verify(public, v.alg, flipped(message, 0).view(), raw.view()).unwrap(), false)
+    assert_eq(verify(public, v.alg, flipped(message, message.len - 1).view(), raw.view()).unwrap(), false)
+    assert_eq(verify(public, v.alg, "".bytes, raw.view()).unwrap(), false)
+
+    // r and s the other way round.
+    var swapped: Buf[u8] = buf()
+
+    swapped.extend(raw.view()[n..<(2 * n)])
+    swapped.extend(raw.view()[0..<n])
+
+    assert_eq(verify(public, v.alg, message, swapped.view()).unwrap(), false)
+end check_ec_can_fail
+
+@test
+rfc_6979_p256_sha256_sample()
+    check_ec(p256_sample())
+
+@test
+rfc_6979_p256_sha256_test()
+    check_ec(p256_test())
+
+@test
+rfc_6979_p384_sha384_sample()
+    check_ec(p384_sample())
+
+@test
+rfc_6979_p384_sha384_test()
+    check_ec(p384_test())
+
+@test
+an_ecdsa_signature_with_anything_changed_does_not_check_out()
+    check_ec_can_fail(p256_sample())
+    check_ec_can_fail(p256_test())
+    check_ec_can_fail(p384_sample())
+    check_ec_can_fail(p384_test())
+
+@test
+one_rfc_6979_signature_does_not_check_out_under_the_other_message()
+    val public = public_key_der(p256_spki().view()).unwrap()
+    val a = p256_sample()
+    val b = p256_test()
+
+    assert_eq(verify(public, Es256, a.message.bytes, joined(b.r, b.s).view()).unwrap(), false)
+    assert_eq(verify(public, Es256, b.message.bytes, joined(a.r, a.s).view()).unwrap(), false)
+
+@test
+a_signature_does_not_check_out_under_another_key()
+    val v = p256_sample()
+    val other = generate_key(KeyKind.EcP256).unwrap().public_key().unwrap()
+
+    assert_eq(verify(other, Es256, v.message.bytes, joined(v.r, v.s).view()).unwrap(), false)
+
+// -- the curve is part of the algorithm ---------------------------------------------------------------
+
+@test
+an_ecdsa_key_on_another_curve_is_refused_rather_than_used()
+    val p256 = private_key_der(p256_pkcs8().view()).unwrap()
+    val p384 = private_key_der(p384_pkcs8().view()).unwrap()
+    val p256_public = public_key_der(p256_spki().view()).unwrap()
+    val p384_public = public_key_der(p384_spki().view()).unwrap()
+    val v = p256_sample()
+    val raw = joined(v.r, v.s)
+    val der = ecdsa_der(Es256, raw.view()).unwrap()
+
+    // **`Err`, where a mere forgery would be `Ok(false)`.**
+    assert(sign(p384, Es256, "sample".bytes).is_err(), "a P-384 key signed ES256")
+    assert(sign_der(p384, Es256, "sample".bytes).is_err(), "a P-384 key signed ES256 in DER")
+    assert(sign(p256, Es384, "sample".bytes).is_err(), "a P-256 key signed ES384")
+    assert(sign_der(p256, Es512, "sample".bytes).is_err(), "a P-256 key signed ES512")
+    assert(verify(p384_public, Es256, "sample".bytes, raw.view()).is_err(), "a P-384 key checked ES256")
+    assert(verify_der(p384_public, Es256, "sample".bytes, der.view()).is_err(), "a P-384 key checked ES256 in DER")
+    assert(verify_der(p256_public, Es384, "sample".bytes, der.view()).is_err(), "a P-256 key checked ES384")
+
+@test
+keys_and_algorithms_of_different_families_are_refused()
+    val ed = ed25519_private_key(unhex(ed_seed()).view()).unwrap()
+    val ed_pub = ed.public_key().unwrap()
+    val ec = private_key_der(p256_pkcs8().view()).unwrap()
+    val ec_pub = ec.public_key().unwrap()
+    var sig: [64]u8
+
+    assert(sign(ed, Es256, "x".bytes).is_err(), "an Ed25519 key signed ES256")
+    assert(sign(ed, Rs256, "x".bytes).is_err(), "an Ed25519 key signed RS256")
+    assert(sign(ed, Ps256, "x".bytes).is_err(), "an Ed25519 key signed PS256")
+    assert(sign(ec, EdDsa, "x".bytes).is_err(), "a P-256 key signed EdDSA")
+    assert(sign(ec, Rs256, "x".bytes).is_err(), "a P-256 key signed RS256")
+    assert(verify(ed_pub, Es256, "x".bytes, sig[0..<64]).is_err(), "an Ed25519 key checked ES256")
+    assert(verify(ec_pub, EdDsa, "x".bytes, sig[0..<64]).is_err(), "a P-256 key checked EdDSA")
+    assert(verify_der(ed_pub, Rs256, "x".bytes, sig[0..<64]).is_err(), "an Ed25519 key checked RS256")
+    assert(verify_der(ec_pub, Ps384, "x".bytes, sig[0..<64]).is_err(), "a P-256 key checked PS384")
+
+// -- DER, strictly ------------------------------------------------------------------------------------
+
+@test
+the_two_forms_convert_only_for_ecdsa_and_only_at_the_curves_width()
+    val v = p256_sample()
+    val raw = joined(v.r, v.s)
+
+    assert(ecdsa_der(Es256, raw.view()).is_some(), "64 bytes were not converted for ES256")
+    assert(ecdsa_der(Es384, raw.view()).is_none(), "64 bytes were converted for ES384")
+    assert(ecdsa_der(Es256, raw.view()[0..<63]).is_none(), "63 bytes were converted")
+    assert(ecdsa_der(Es256, "".bytes).is_none(), "no bytes were converted")
+    assert(ecdsa_der(Rs256, raw.view()).is_none(), "an RSA algorithm has no coordinates")
+    assert(ecdsa_der(EdDsa, raw.view()).is_none(), "EdDSA has no DER form")
+
+    val der = ecdsa_der(Es256, raw.view()).unwrap()
+
+    assert(ecdsa_raw(Es256, der.view()).unwrap() == raw, "the conversion does not come back")
+    assert(ecdsa_raw(Rs256, der.view()).is_none(), "an RSA algorithm has no coordinates")
+    assert(ecdsa_raw(EdDsa, der.view()).is_none(), "EdDSA has no DER form")
+
+    // **RFC 6979's P-256 `test` signature has an `s` that starts 01**, and its `r` starts f1: one
+    // integer that DER writes as it stands and one that needs a zero in front.
+    val t = p256_test()
+    val t_der = ecdsa_der(Es256, joined(t.r, t.s).view()).unwrap()
+
+    assert_eq(t_der.len(), 2 + (2 + 33) + (2 + 32))
+    assert_eq(t_der[3], 33)
+    assert_eq(t_der[4], 0)
+
+@test
+der_written_any_way_but_the_canonical_one_is_not_a_signature()
+    val v = p256_test()
+    val public = public_key_der(v.spki.view()).unwrap()
+    val der = ecdsa_der(Es256, joined(v.r, v.s).view()).unwrap()
+
+    assert(verify_der(public, Es256, v.message.bytes, der.view()).unwrap(), "the canonical form did not check out")
+
+    // The same two integers with a needless zero in front of `s`, and every length adjusted: BER
+    // would read it as the same signature.
+    val r_len = usize(der[3])
+    var padded: Buf[u8] = buf()
+
+    padded.push(0x30)
+    padded.push(der[1] + 1)
+    padded.extend(der.view()[2..<(4 + r_len)])
+    padded.push(0x02)
+    padded.push(der[5 + r_len] + 1)
+    padded.push(0x00)
+    padded.extend(der.view()[(6 + r_len)..<der.len()])
+
+    assert_eq(padded.len(), der.len() + 1)
+    assert(ecdsa_raw(Es256, padded.view()).is_none(), "a needlessly padded integer was read as canonical")
+    assert_eq(verify_der(public, Es256, v.message.bytes, padded.view()).unwrap(), false)
+
+    // A byte after the signature.
+    var trailing: Buf[u8] = buf()
+
+    trailing.extend(der.view())
+    trailing.push(0)
+
+    assert(ecdsa_raw(Es256, trailing.view()).is_none(), "a signature with a byte after it was read")
+    assert_eq(verify_der(public, Es256, v.message.bytes, trailing.view()).unwrap(), false)
+
+    // Cut short, not DER at all, and nothing: each a verdict, none an error.
+    assert_eq(verify_der(public, Es256, v.message.bytes, der.view()[0..<(der.len() - 1)]).unwrap(), false)
+    assert_eq(verify_der(public, Es256, v.message.bytes, "not a signature".bytes).unwrap(), false)
+    assert_eq(verify_der(public, Es256, v.message.bytes, "".bytes).unwrap(), false)
+
+    // JOSE's form handed to the DER call is not a signature either -- the mistake the two calls
+    // exist to keep apart.
+    assert_eq(verify_der(public, Es256, v.message.bytes, joined(v.r, v.s).view()).unwrap(), false)
+
+    // A P-384 signature's integers do not fit P-256.
+    val wide = p384_sample()
+    val wide_der = ecdsa_der(Es384, joined(wide.r, wide.s).view()).unwrap()
+
+    assert(ecdsa_raw(Es256, wide_der.view()).is_none(), "48-byte integers were read as P-256's")
+    assert_eq(verify_der(public, Es256, v.message.bytes, wide_der.view()).unwrap(), false)
+
+// -- generated keys, every kind -----------------------------------------------------------------------
+
+@test
+a_generated_key_of_each_kind_signs_and_its_public_half_verifies()
+    val message = "sh.sysl.openssl".bytes
+
+    val ed = generate_key(KeyKind.Ed25519).unwrap()
+    val ed_sig = sign(ed, EdDsa, message).unwrap()
+
+    assert_eq(ed_sig.len(), 64)
+    assert(verify(ed.public_key().unwrap(), EdDsa, message, ed_sig.view()).unwrap(), "Ed25519")
+    assert_eq(verify(ed.public_key().unwrap(), EdDsa, "sh.sysl.openssL".bytes, ed_sig.view()).unwrap(), false)
+
+    val p256 = generate_key(KeyKind.EcP256).unwrap()
+
+    assert(verify(p256.public_key().unwrap(), Es256, message, sign(p256, Es256, message).unwrap().view()).unwrap(), "P-256")
+
+    val p384 = generate_key(KeyKind.EcP384).unwrap()
+
+    assert(verify_der(p384.public_key().unwrap(), Es384, message, sign_der(p384, Es384, message).unwrap().view()).unwrap(), "P-384")
+
+    val p521 = generate_key(KeyKind.EcP521).unwrap()
+
+    assert(verify(p521.public_key().unwrap(), Es512, message, sign(p521, Es512, message).unwrap().view()).unwrap(), "P-521")
+
+    val rsa = generate_key(KeyKind.Rsa(2048)).unwrap()
+    val rsa_public = rsa.public_key().unwrap()
+
+    assert(verify(rsa_public, Rs256, message, sign(rsa, Rs256, message).unwrap().view()).unwrap(), "RSA PKCS#1 v1.5")
+    assert(verify(rsa_public, Ps256, message, sign(rsa, Ps256, message).unwrap().view()).unwrap(), "RSA PSS")
+
+    // **PKCS#1 v1.5 and PSS are different signatures over one key**, and neither passes as the other.
+    assert_eq(verify(rsa_public, Ps256, message, sign(rsa, Rs256, message).unwrap().view()).unwrap(), false)
+    assert_eq(verify(rsa_public, Rs256, message, sign(rsa, Ps256, message).unwrap().view()).unwrap(), false)
+
+    // And the digest is part of the algorithm.
+    assert_eq(verify(rsa_public, Rs384, message, sign(rsa, Rs256, message).unwrap().view()).unwrap(), false)
+    assert_eq(verify(rsa_public, Ps512, message, sign(rsa, Ps256, message).unwrap().view()).unwrap(), false)

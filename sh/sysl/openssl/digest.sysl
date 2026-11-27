@@ -1,0 +1,155 @@
+// Digests: SHA-1 and the SHA-2 family, all at once or a piece at a time.
+//
+// **The digest is an argument everywhere it is a choice** -- here, and in the HMAC and HKDF built on
+// it -- so one enum names it for the whole package and nothing takes a string OpenSSL would have to
+// look up and might not find.
+//
+// **SHA-1 is here for what still names it**, which is HMAC-SHA-1 in HOTP and TOTP (RFC 4226,
+// RFC 6238) and a handful of older protocols. On its own it is broken: two inputs with one digest
+// can be made on purpose. HMAC over it is not, since a collision does not give a forgery.
+
+module sh.sysl.openssl
+
+import sh.sysl.openssl.c
+import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.buf.{Buf, buf_filled}
+
+// A digest algorithm.
+enum Digest
+    Sha1
+    Sha224
+    Sha256
+    Sha384
+    Sha512
+end Digest
+
+// How many bytes the digest is: 20, 28, 32, 48 or 64.
+digest_size(of: Digest) -> usize = of match
+    Sha1 -> 20
+    Sha224 -> 28
+    Sha256 -> 32
+    Sha384 -> 48
+    Sha512 -> 64
+
+private[openssl] md_of(of: Digest) -> *c.EvpMd = of match
+    Sha1 -> c.sha1()
+    Sha224 -> c.sha224()
+    Sha256 -> c.sha256()
+    Sha384 -> c.sha384()
+    Sha512 -> c.sha512()
+
+// The name OpenSSL fetches the digest by, for the algorithms that are configured with parameters.
+// **A literal, so it is NUL-terminated**, which a parameter measuring its own string relies on.
+private[openssl] md_name(of: Digest) -> string = of match
+    Sha1 -> "SHA1"
+    Sha224 -> "SHA224"
+    Sha256 -> "SHA256"
+    Sha384 -> "SHA384"
+    Sha512 -> "SHA512"
+
+// A failure this package found before OpenSSL was asked anything, so there is no queue to read.
+private[openssl] refused(what: string) -> Error = Error(c.SSL_ERROR_SSL, 0, what, 0)
+
+// The digest of `data`.
+digest(of: Digest, data: []const u8) -> Result[Buf[u8], Error]
+    var out = buf_filled(digest_size(of), u8(0))
+    var wrote: u32 = 0
+    var nothing: [1]u8
+    val from = if data.len == 0 then &nothing[0] else as_ptr(data)
+
+    c.err_clear_error()
+
+    if c.digest(from, data.len, as_mut_ptr(out.view_mut()), &wrote, md_of(of), null) != 1
+        return Err(fail(c.SSL_ERROR_SSL, "the digest could not be computed"))
+
+    if usize(wrote) != out.len() then return Err(refused("OpenSSL produced a digest of another length"))
+
+    Ok(out)
+end digest
+
+// A digest in progress.
+//
+// **Finished once.** `finish` answers the digest of everything fed so far and the hasher is then
+// spent: feeding it or finishing it again is refused, rather than answering the digest of some other
+// message than the one the caller has in mind.
+struct Hasher
+    private ctx: *c.EvpMdCtx
+    private of: Digest
+    private spent: bool
+
+    // Feed more of the message. Any split of a message into pieces gives the same digest.
+    update(&self, data: []const u8) -> Result[unit, Error]
+        if self.spent then return Err(refused("this hasher has already been finished"))
+
+        if data.len == 0 then return Ok(())
+
+        c.err_clear_error()
+
+        if c.digest_update(self.ctx, as_ptr(data), data.len) != 1
+            return Err(fail(c.SSL_ERROR_SSL, "the digest would not take those bytes"))
+
+        Ok(())
+    end update
+
+    // The digest of everything fed.
+    finish(&self) -> Result[Buf[u8], Error]
+        if self.spent then return Err(refused("this hasher has already been finished"))
+
+        self.spent = true
+
+        var out = buf_filled(digest_size(self.of), u8(0))
+        var wrote: u32 = 0
+
+        c.err_clear_error()
+
+        if c.digest_final(self.ctx, as_mut_ptr(out.view_mut()), &wrote) != 1 || usize(wrote) != out.len()
+            return Err(fail(c.SSL_ERROR_SSL, "the digest could not be finished"))
+
+        Ok(out)
+    end finish
+end Hasher
+
+impl Drop for Hasher
+    drop(self) = c.md_ctx_free(self.ctx)
+
+// Begin a digest.
+hasher(of: Digest) -> Result[&Hasher, Error]
+    c.err_clear_error()
+
+    val ctx = c.md_ctx_new()
+
+    if ctx == null then return Err(fail(c.SSL_ERROR_SSL, "could not begin a digest"))
+
+    if c.digest_init(ctx, md_of(of), null) != 1
+        val why = fail(c.SSL_ERROR_SSL, "could not begin a digest")
+
+        c.md_ctx_free(ctx)
+
+        return Err(why)
+    end if
+
+    Ok(Hasher(ctx, of, false))
+end hasher
+
+// -- memory -------------------------------------------------------------------------------------------
+
+// Whether two byte strings are the same, **in a time that does not depend on where they differ**.
+// This is how a received MAC or tag is compared with the one computed: `==` stops at the first
+// difference, and how long it took tells an attacker how much of a forgery was right. The lengths
+// are not secret, and strings of different lengths are simply different.
+equal(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+
+    if a.len == 0 then return true
+
+    c.crypto_memcmp(as_ptr(a), as_ptr(b), a.len) == 0
+end equal
+
+// Overwrite `bytes` with zeros, in a way the optimiser may not remove. For a key or a plaintext a
+// caller is done with: a buffer that is merely dropped keeps its contents until something else
+// happens to be written there.
+wipe(bytes: []u8)
+    if bytes.len == 0 then return
+
+    c.cleanse(as_mut_ptr(bytes), bytes.len)
+end wipe

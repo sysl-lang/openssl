@@ -1,0 +1,364 @@
+// HMAC against RFC 4231 and RFC 2202, and HKDF against RFC 5869.
+//
+// **RFC 4231 gives each test case's answer under SHA-224, SHA-256, SHA-384 and SHA-512**, so one key
+// and one message check four digests, and a digest wired to the wrong name fails three of them.
+// RFC 2202 is the same for SHA-1. RFC 5869 prints the intermediate pseudorandom key as well as the
+// output, which is what lets the two halves of HKDF be checked apart.
+//
+// **RFC 5869 has no SHA-384 or SHA-512 case**, so those are held to the RFC's definition instead:
+// extract is one HMAC and expand is a chain of them, computed here from `hmac` -- which RFC 4231 has
+// already vouched for -- and compared with what OpenSSL's HKDF answers.
+
+module sh.sysl.openssl
+@tests
+
+import sysl.harness.*
+import sysl.buf.{Buf, buf, buf_filled}
+
+// `n` bytes counting up from `first`.
+private run(first: u8, n: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    for i in 0..<n
+        out.push(first + u8(i))
+
+    out
+end run
+
+private struct Case
+    key: Buf[u8]
+    data: Buf[u8]
+    sha224: string
+    sha256: string
+    sha384: string
+    sha512: string
+end Case
+
+private text(s: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    out.extend(s.bytes)
+
+    out
+end text
+
+private check(case: Case)
+    assert(hmac(Sha224, case.key.view(), case.data.view()).unwrap() == unhex(case.sha224), "HMAC-SHA-224")
+    assert(hmac(Sha256, case.key.view(), case.data.view()).unwrap() == unhex(case.sha256), "HMAC-SHA-256")
+    assert(hmac(Sha384, case.key.view(), case.data.view()).unwrap() == unhex(case.sha384), "HMAC-SHA-384")
+    assert(hmac(Sha512, case.key.view(), case.data.view()).unwrap() == unhex(case.sha512), "HMAC-SHA-512")
+end check
+
+// -- RFC 4231 -----------------------------------------------------------------------------------------
+
+private case_1() -> Case = Case(buf_filled(20, u8(0x0b)), text("Hi There"),
+    "896fb1128abbdf196832107cd49df33f47b4b1169912ba4f53684b22",
+    "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+    "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6",
+    "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854")
+
+private case_2() -> Case = Case(text("Jefe"), text("what do ya want for nothing?"),
+    "a30e01098bc6dbbf45690f3a7e9e6d0f8bbea2a39e6148008fd05e44",
+    "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+    "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649",
+    "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737")
+
+@test
+rfc_4231_case_1()
+    check(case_1())
+
+@test
+rfc_4231_case_2_a_key_shorter_than_the_digest()
+    check(case_2())
+
+@test
+rfc_4231_case_3_data_longer_than_the_digest()
+    check(Case(buf_filled(20, u8(0xaa)), buf_filled(50, u8(0xdd)),
+        "7fb3cb3588c6c1f6ffa9694d7d6ad2649365b0c1f65d69d1ec8333ea",
+        "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
+        "88062608d3e6ad8a0aa2ace014c8a86f0aa635d947ac9febe83ef4e55966144b2a5ab39dc13814b94e3ab6e101a34f27",
+        "fa73b0089d56a284efb0f0756c890be9b1b5dbdd8ee81a3655f83e33b2279d39bf3e848279a722c806b485a47e67c807b946a337bee8942674278859e13292fb"))
+
+@test
+rfc_4231_case_4()
+    check(Case(run(0x01, 25), buf_filled(50, u8(0xcd)),
+        "6c11506874013cac6a2abc1bb382627cec6a90d86efc012de7afec5a",
+        "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b",
+        "3e8a69b7783c25851933ab6290af6ca77a9981480850009cc5577c6e1f573b4e6801dd23c4a7d679ccf8a386c674cffb",
+        "b0ba465637458c6990e5a8c5f61d4af7e576d97ff94b872de76f8050361ee3dba91ca5c11aa25eb4d679275cc5788063a5f19741120c4f2de2adebeb10a298dd"))
+
+@test
+rfc_4231_case_5_the_first_128_bits()
+    // The RFC truncates this one, so what it prints is the front of each MAC.
+    val key = buf_filled(20, u8(0x0c))
+    val data = "Test With Truncation".bytes
+
+    assert(hmac(Sha224, key.view(), data).unwrap().view()[0..<16] == unhex("0e2aea68a90c8d37c988bcdb9fca6fa8").view(), "HMAC-SHA-224")
+    assert(hmac(Sha256, key.view(), data).unwrap().view()[0..<16] == unhex("a3b6167473100ee06e0c796c2955552b").view(), "HMAC-SHA-256")
+    assert(hmac(Sha384, key.view(), data).unwrap().view()[0..<16] == unhex("3abf34c3503b2a23a46efc619baef897").view(), "HMAC-SHA-384")
+    assert(hmac(Sha512, key.view(), data).unwrap().view()[0..<16] == unhex("415fad6271580a531d4179bc891d87a6").view(), "HMAC-SHA-512")
+
+@test
+rfc_4231_case_6_a_key_longer_than_a_block()
+    // 131 bytes is past SHA-512's 128-byte block as well as SHA-256's 64, so the key is hashed first
+    // under every digest here.
+    check(Case(buf_filled(131, u8(0xaa)), text("Test Using Larger Than Block-Size Key - Hash Key First"),
+        "95e9a0db962095adaebe9b2d6f0dbce2d499f112f2d2b7273fa6870e",
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+        "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952",
+        "80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f3526b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598"))
+
+@test
+rfc_4231_case_7_a_long_key_and_long_data()
+    check(Case(buf_filled(131, u8(0xaa)),
+        text("This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm."),
+        "3a854166ac5d9f023f54d517d0b39dbd946770db9c2b95c9f6f565d1",
+        "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2",
+        "6617178e941f020d351e2f254e8fd32c602420feb0b8fb9adccebb82461e99c5a678cc31e799176d3860e6110c46523e",
+        "e37b6a775dc87dbaa4dfa9f96e5e3ffddebd71f8867289865df5a32d20cdc944b6022cac3c4982b10d5eeb55c3e4de15134676fb6de0446065c97440fa8c6a58"))
+
+// -- RFC 2202 -----------------------------------------------------------------------------------------
+
+@test
+rfc_2202_hmac_sha1()
+    assert(hmac(Sha1, buf_filled(20, u8(0x0b)).view(), "Hi There".bytes).unwrap() ==
+        unhex("b617318655057264e28bc0b6fb378c8ef146be00"), "case 1")
+    assert(hmac(Sha1, "Jefe".bytes, "what do ya want for nothing?".bytes).unwrap() ==
+        unhex("effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"), "case 2")
+    assert(hmac(Sha1, buf_filled(20, u8(0xaa)).view(), buf_filled(50, u8(0xdd)).view()).unwrap() ==
+        unhex("125d7342b9ac11cd91a39af48aa17b4f63f175d3"), "case 3")
+
+// -- what the vectors do not reach --------------------------------------------------------------------
+
+@test
+each_input_of_an_hmac_matters()
+    // **The vectors can fail.** One bit of the key, one bit of the message, and the digest named:
+    // each changes the answer, so none of them is being ignored.
+    val c2 = case_2()
+    val right = hmac(Sha256, c2.key.view(), c2.data.view()).unwrap()
+
+    assert(right == unhex(c2.sha256), "the starting point is not RFC 4231's")
+    assert(hmac(Sha256, flipped(c2.key.view(), 0).view(), c2.data.view()).unwrap() != right, "the key")
+    assert(hmac(Sha256, flipped(c2.key.view(), 3).view(), c2.data.view()).unwrap() != right, "the key's last byte")
+    assert(hmac(Sha256, c2.key.view(), flipped(c2.data.view(), 0).view()).unwrap() != right, "the message")
+    assert(hmac(Sha256, c2.key.view(), flipped(c2.data.view(), 27).view()).unwrap() != right, "the message's last byte")
+    assert(hmac(Sha256, c2.data.view(), c2.key.view()).unwrap() != right, "the key and the message changed places")
+
+@test
+an_empty_key_and_an_empty_message_are_allowed()
+    // HMAC-SHA-256 of nothing under no key, which is what a null key pointer would get wrong.
+    assert(hmac(Sha256, "".bytes, "".bytes).unwrap() ==
+        unhex("b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad"),
+        "HMAC-SHA-256 with an empty key and message")
+
+    // An empty key is a block of zeros, so it and a key of one zero byte are the same HMAC key.
+    var zero: [1]u8
+
+    assert(hmac(Sha384, "".bytes, "abc".bytes).unwrap() == hmac(Sha384, zero[0..<1], "abc".bytes).unwrap(),
+        "an empty key is not the all-zero key")
+
+@test
+every_split_of_a_message_gives_the_one_shot_hmac()
+    val c7 = case_7_data()
+    val key = buf_filled(131, u8(0xaa))
+    val whole = hmac(Sha512, key.view(), c7.view()).unwrap()
+
+    assert(whole == unhex("e37b6a775dc87dbaa4dfa9f96e5e3ffddebd71f8867289865df5a32d20cdc944b6022cac3c4982b10d5eeb55c3e4de15134676fb6de0446065c97440fa8c6a58"),
+        "the starting point is not RFC 4231's")
+
+    for cut in 0..<(c7.len() + 1)
+        val h = hmac_begin(Sha512, key.view()).unwrap()
+
+        h.update(c7.view()[0..<cut]).unwrap()
+        h.update(c7.view()[cut..<c7.len()]).unwrap()
+
+        assert(h.finish().unwrap() == whole, s"splitting at ${cut} changed the HMAC")
+    end for
+
+private case_7_data() -> Buf[u8] =
+    text("This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.")
+
+@test
+a_finished_hmac_is_spent()
+    val h = hmac_begin(Sha256, "Jefe".bytes).unwrap()
+
+    h.update("what do ya want ".bytes).unwrap()
+    h.update("for nothing?".bytes).unwrap()
+
+    assert(h.finish().unwrap() == unhex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+        "two pieces did not make RFC 4231's case 2")
+    assert(h.update("more".bytes).is_err(), "a finished HMAC took more")
+    assert(h.finish().is_err(), "an HMAC was finished twice")
+
+@test
+the_key_is_copied_when_the_hmac_begins()
+    // The caller's key may be wiped as soon as `hmac_begin` answers.
+    var key = text("Jefe")
+    val h = hmac_begin(Sha256, key.view()).unwrap()
+
+    wipe(key.view_mut())
+    h.update("what do ya want for nothing?".bytes).unwrap()
+
+    assert(h.finish().unwrap() == unhex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+        "the HMAC read its key after it began")
+
+// -- RFC 5869 -----------------------------------------------------------------------------------------
+
+private struct Derivation
+    of: Digest
+    secret: Buf[u8]
+    salt: Buf[u8]
+    info: Buf[u8]
+    length: usize
+    prk: string
+    okm: string
+end Derivation
+
+// The whole, and the two halves separately: extract answers the RFC's PRK, expanding that PRK
+// answers the RFC's OKM.
+private check_hkdf(d: Derivation)
+    val prk = unhex(d.prk)
+    val okm = unhex(d.okm)
+
+    assert(hkdf(d.of, d.secret.view(), d.salt.view(), d.info.view(), d.length).unwrap() == okm, "the output key")
+    assert(hkdf_extract(d.of, d.salt.view(), d.secret.view()).unwrap() == prk, "the pseudorandom key")
+    assert(hkdf_expand(d.of, prk.view(), d.info.view(), d.length).unwrap() == okm, "the expansion")
+end check_hkdf
+
+private rfc_5869_case_1() -> Derivation = Derivation(Sha256, buf_filled(22, u8(0x0b)), run(0x00, 13), run(0xf0, 10), 42,
+    "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5",
+    "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+
+@test
+rfc_5869_case_1_sha256()
+    check_hkdf(rfc_5869_case_1())
+
+@test
+rfc_5869_case_2_sha256_with_longer_inputs_and_output()
+    check_hkdf(Derivation(Sha256, run(0x00, 80), run(0x60, 80), run(0xb0, 80), 82,
+        "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244",
+        "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87"))
+
+@test
+rfc_5869_case_3_sha256_with_no_salt_and_no_info()
+    check_hkdf(Derivation(Sha256, buf_filled(22, u8(0x0b)), buf(), buf(), 42,
+        "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04",
+        "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"))
+
+@test
+rfc_5869_case_4_sha1()
+    check_hkdf(Derivation(Sha1, buf_filled(11, u8(0x0b)), run(0x00, 13), run(0xf0, 10), 42,
+        "9b6c18c432a7bf8f0e71c8eb88f4b30baa2ba243",
+        "085a01ea1b10f36933068b56efa5ad81a4f14b822f5b091568a9cdd4f155fda2c22e422478d305f3f896"))
+
+@test
+rfc_5869_case_5_sha1_with_longer_inputs_and_output()
+    check_hkdf(Derivation(Sha1, run(0x00, 80), run(0x60, 80), run(0xb0, 80), 82,
+        "8adae09a2a307059478d309b26c4115a224cfaf6",
+        "0bd770a74d1160f7c9f12cd5912a06ebff6adcae899d92191fe4305673ba2ffe8fa3f1a4e5ad79f3f334b3b202b2173c486ea37ce3d397ed034c7f9dfeb15c5e927336d0441f4c4300e2cff0d0900b52d3b4"))
+
+@test
+rfc_5869_case_6_sha1_with_no_salt_and_no_info()
+    check_hkdf(Derivation(Sha1, buf_filled(22, u8(0x0b)), buf(), buf(), 42,
+        "da8c8a73c7fa77288ec6f5e7c297786aa0d32d01",
+        "0ac1af7002b3d761d1e55298da9d0506b9ae52057220a306e07b6b87e8df21d0ea00033de03984d34918"))
+
+@test
+rfc_5869_case_7_sha1_with_the_salt_not_provided()
+    check_hkdf(Derivation(Sha1, buf_filled(22, u8(0x0c)), buf(), buf(), 42,
+        "2adccada18779e7c2077ad2eb19d3f3e731385dd",
+        "2c91117204d745f3500d636a62f64f0ab3bae548aa53d423b0d1f27ebba6f5e5673a081d70cce7acfc48"))
+
+@test
+each_input_of_hkdf_matters()
+    // **The vectors can fail.** A bit of the secret, of the salt, of the info, the digest, and the
+    // length asked for: each gives other bytes.
+    val d = rfc_5869_case_1()
+    val right = hkdf(d.of, d.secret.view(), d.salt.view(), d.info.view(), d.length).unwrap()
+
+    assert(right == unhex(d.okm), "the starting point is not RFC 5869's")
+    assert(hkdf(d.of, flipped(d.secret.view(), 21).view(), d.salt.view(), d.info.view(), d.length).unwrap() != right, "the secret")
+    assert(hkdf(d.of, d.secret.view(), flipped(d.salt.view(), 12).view(), d.info.view(), d.length).unwrap() != right, "the salt")
+    assert(hkdf(d.of, d.secret.view(), d.salt.view(), flipped(d.info.view(), 9).view(), d.length).unwrap() != right, "the info")
+    assert(hkdf(Sha512, d.secret.view(), d.salt.view(), d.info.view(), d.length).unwrap() != right, "the digest")
+    assert(hkdf(d.of, d.salt.view(), d.secret.view(), d.info.view(), d.length).unwrap() != right, "the salt and the secret changed places")
+
+    // A shorter output is the front of a longer one, which is RFC 5869's definition of the length.
+    val short = hkdf(d.of, d.secret.view(), d.salt.view(), d.info.view(), 16).unwrap()
+
+    assert_eq(short.len(), 16)
+    assert(short.view() == right.view()[0..<16], "a shorter output is not the front of a longer one")
+
+    // And expand is held to its own inputs: the pseudorandom key and the info.
+    val prk = unhex(d.prk)
+
+    assert(hkdf_expand(d.of, flipped(prk.view(), 0).view(), d.info.view(), d.length).unwrap() != right, "the pseudorandom key")
+    assert(hkdf_expand(d.of, prk.view(), "".bytes, d.length).unwrap() != right, "the info of an expansion")
+
+// RFC 5869 section 2.3, from `hmac`: T(1) = HMAC(PRK, info | 0x01), T(n) = HMAC(PRK, T(n-1) | info | n).
+private expanded_by_hand(of: Digest, prk: []const u8, info: []const u8, length: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    var last: Buf[u8] = buf()
+    var counter: u8 = 1
+
+    while out.len() < length
+        var block: Buf[u8] = buf()
+
+        block.extend(last.view())
+        block.extend(info)
+        block.push(counter)
+
+        last = hmac(of, prk, block.view()).unwrap()
+        out.extend(last.view())
+        counter += 1
+    end while
+
+    out.truncate(length)
+
+    out
+end expanded_by_hand
+
+@test
+hkdf_is_rfc_5869s_definition_over_every_digest()
+    val all = [Sha1, Sha224, Sha256, Sha384, Sha512]
+    val secret = run(0x10, 40)
+    val salt = run(0x80, 20)
+    val info = "sh.sysl.openssl hkdf".bytes
+
+    for of in all
+        // Three and a bit blocks of output, so the chain is walked and its last block cut short.
+        val length = 3 * digest_size(of) + 5
+        val prk = hkdf_extract(of, salt.view(), secret.view()).unwrap()
+
+        assert_eq(prk.len(), digest_size(of))
+        assert(prk == hmac(of, salt.view(), secret.view()).unwrap(), "extract is not HMAC(salt, secret)")
+
+        val by_hand = expanded_by_hand(of, prk.view(), info, length)
+
+        assert(hkdf_expand(of, prk.view(), info, length).unwrap() == by_hand, "expand is not the RFC's chain of HMACs")
+        assert(hkdf(of, secret.view(), salt.view(), info, length).unwrap() == by_hand, "the whole is not extract then expand")
+
+        // No salt is a digest's worth of zeros.
+        val zeros = buf_filled(digest_size(of), u8(0))
+
+        assert(hkdf_extract(of, "".bytes, secret.view()).unwrap() == hmac(of, zeros.view(), secret.view()).unwrap(),
+            "an empty salt is not a digest's worth of zeros")
+    end for
+
+@test
+hkdf_lengths_out_of_range_are_refused()
+    val secret = run(0x00, 32)
+
+    assert(hkdf(Sha256, secret.view(), "".bytes, "".bytes, 0).is_err(), "no bytes were derived and called a key")
+    assert_eq(hkdf(Sha256, secret.view(), "".bytes, "".bytes, 255 * 32).unwrap().len(), 255 * 32)
+    assert(hkdf(Sha256, secret.view(), "".bytes, "".bytes, 255 * 32 + 1).is_err(), "more than 255 blocks were derived")
+    assert(hkdf_expand(Sha256, secret.view(), "".bytes, 255 * 32 + 1).is_err(), "more than 255 blocks were expanded")
+    assert(hkdf_expand(Sha256, secret.view(), "".bytes, 0).is_err(), "no bytes were expanded and called a key")
+
+@test
+a_pseudorandom_key_shorter_than_the_digest_is_refused()
+    val prk = run(0x00, 48)
+
+    assert(hkdf_expand(Sha384, prk.view(), "".bytes, 16).is_ok(), "a key as long as the digest was refused")
+    assert(hkdf_expand(Sha384, prk.view()[0..<47], "".bytes, 16).is_err(), "a key shorter than the digest was expanded")
+    assert(hkdf_expand(Sha256, prk.view()[0..<47], "".bytes, 16).is_ok(), "a key longer than the digest was refused")

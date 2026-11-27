@@ -11,9 +11,12 @@
 // arrangement checks one against the other.
 //
 // **THIS IS A PARTIAL BINDING AND SAYS SO.** OpenSSL's surface is thousands of functions; what is
-// here is TLS over memory buffers -- both ends of it -- plus the digest signing a token needs, which
-// is fifty-odd of them. Adding to it is ordinary -- the rule is only that what is here is faithful,
-// not that it is complete.
+// here is TLS over memory buffers -- both ends of it -- plus keys, signatures, digests, HMAC, HKDF and
+// authenticated encryption through the EVP tier, which is about a hundred of them. Adding to it is
+// ordinary -- the rule is only that what is here is faithful, not that it is complete.
+//
+// **Nothing deprecated is declared.** Every function here is one OpenSSL 3 still recommends and
+// OpenSSL 4 still exports, so the same declarations link against both.
 //
 // **There is no C shim, which is worth knowing because two things look like they need one.**
 // `SSL_set_tlsext_host_name` and `SSL_CTX_set_min_proto_version` are macros, so they have no
@@ -32,6 +35,10 @@ module sh.sysl.openssl.c
 @include("openssl/pem.h")
 @include("openssl/evp.h")
 @include("openssl/rsa.h")
+@include("openssl/x509.h")
+@include("openssl/kdf.h")
+@include("openssl/params.h")
+@include("openssl/crypto.h")
 
 // ## The handles
 //
@@ -270,6 +277,150 @@ extern "EVP_DigestSign" digest_sign(ctx: *EvpMdCtx, sig: *u8, siglen: *usize, tb
 extern "EVP_PKEY_CTX_set_rsa_padding" pkey_ctx_set_rsa_padding(ctx: *EvpPkeyCtx, mode: i32) -> i32
 extern "EVP_PKEY_CTX_set_rsa_pss_saltlen" pkey_ctx_set_rsa_pss_saltlen(ctx: *EvpPkeyCtx, len: i32) -> i32
 
+// ## Keys in their other encodings
+//
+// **`pp` is advanced past what was read**, which is how a caller learns the input had bytes left
+// over: DER has no terminator, and a parser that stops early has still succeeded.
+//
+// `d2i_AutoPrivateKey` reads PKCS#8 and the traditional RSA and EC forms alike; `d2i_PUBKEY` reads a
+// SubjectPublicKeyInfo and nothing else.
+extern "d2i_AutoPrivateKey" d2i_auto_private_key(a: **EvpPkey, pp: **u8, length: i64) -> *EvpPkey
+extern "d2i_PUBKEY" d2i_pubkey(a: **EvpPkey, pp: **u8, length: i64) -> *EvpPkey
+
+// Written into a memory `BIO`, so one way of taking bytes back out serves all four encodings.
+// **A null cipher is an unencrypted PKCS#8 `PrivateKeyInfo`**, and the passphrase arguments after it
+// are then never read.
+extern "i2d_PUBKEY_bio" i2d_pubkey_bio(b: *Bio, pkey: *EvpPkey) -> i32
+extern "i2d_PKCS8PrivateKey_bio" i2d_pkcs8_private_key_bio(b: *Bio, pkey: *EvpPkey, enc: *u8, kstr: *u8, klen: i32, cb: *u8, u: *u8) -> i32
+extern "PEM_write_bio_PUBKEY" pem_write_bio_pubkey(b: *Bio, pkey: *EvpPkey) -> i32
+extern "PEM_write_bio_PKCS8PrivateKey" pem_write_bio_pkcs8_private_key(b: *Bio, pkey: *EvpPkey, enc: *u8, kstr: *u8, klen: i32, cb: *u8, u: *u8) -> i32
+
+// The raw form, which only the Edwards and Montgomery families have. **The engine argument has to
+// be null**: OpenSSL 3 ignores it and OpenSSL 4 says so in the header.
+extern "EVP_PKEY_new_raw_private_key" pkey_new_raw_private_key(ty: i32, e: *u8, key: *u8, len: usize) -> *EvpPkey
+extern "EVP_PKEY_new_raw_public_key" pkey_new_raw_public_key(ty: i32, e: *u8, key: *u8, len: usize) -> *EvpPkey
+
+// **`len` goes in as the room and comes out as what was written.**
+extern "EVP_PKEY_get_raw_private_key" pkey_get_raw_private_key(p: *EvpPkey, out: *u8, len: *usize) -> i32
+extern "EVP_PKEY_get_raw_public_key" pkey_get_raw_public_key(p: *EvpPkey, out: *u8, len: *usize) -> i32
+
+// What a key is, past its family: the modulus of an RSA key in bits, and the curve of an EC one by
+// OpenSSL's own name for it (`prime256v1`, `secp384r1`, `secp521r1`).
+extern "EVP_PKEY_get_bits" pkey_bits(p: *EvpPkey) -> i32
+extern "EVP_PKEY_get_group_name" pkey_group_name(p: *EvpPkey, name: *u8, name_sz: usize, gname_len: *usize) -> i32
+
+// ## Making a key
+//
+// **This `EvpPkeyCtx` is owned**, unlike the one a digest hands back: it came from
+// `EVP_PKEY_CTX_new_from_name` and is freed with `EVP_PKEY_CTX_free`.
+extern "EVP_PKEY_CTX_new_from_name" pkey_ctx_new_from_name(libctx: *u8, name: *u8, propquery: *u8) -> *EvpPkeyCtx
+extern "EVP_PKEY_CTX_free" pkey_ctx_free(ctx: *EvpPkeyCtx)
+extern "EVP_PKEY_keygen_init" pkey_keygen_init(ctx: *EvpPkeyCtx) -> i32
+extern "EVP_PKEY_generate" pkey_generate(ctx: *EvpPkeyCtx, out: **EvpPkey) -> i32
+extern "EVP_PKEY_CTX_set_group_name" pkey_ctx_set_group_name(ctx: *EvpPkeyCtx, name: *u8) -> i32
+extern "EVP_PKEY_CTX_set_rsa_keygen_bits" pkey_ctx_set_rsa_keygen_bits(ctx: *EvpPkeyCtx, bits: i32) -> i32
+
+// ## Digests
+//
+// **The `EVP_sha*` functions answer a static description and never fail**; nothing is fetched and
+// nothing is freed.
+extern "EVP_sha1" sha1() -> *EvpMd
+extern "EVP_sha224" sha224() -> *EvpMd
+extern "EVP_MD_get_size" md_size(md: *EvpMd) -> i32
+
+// All of it in one call. **`size` is an `unsigned int`, not a `size_t`**, here and in
+// `EVP_DigestFinal_ex`.
+extern "EVP_Digest" digest(data: *u8, count: usize, md: *u8, size: *u32, ty: *EvpMd, e: *u8) -> i32
+
+extern "EVP_DigestInit_ex2" digest_init(ctx: *EvpMdCtx, ty: *EvpMd, params: *OsslParam) -> i32
+extern "EVP_DigestUpdate" digest_update(ctx: *EvpMdCtx, data: *u8, count: usize) -> i32
+extern "EVP_DigestFinal_ex" digest_final(ctx: *EvpMdCtx, md: *u8, size: *u32) -> i32
+
+// ## Parameters
+//
+// OpenSSL 3's way of configuring a fetched algorithm: an array of these, ended by one whose key is
+// null. **Declared field by field because the constructors answer it by value**, and a test holds
+// `sizeof` of this against the header's.
+//
+// **A parameter borrows what it points at.** The key, and the buffer, have to outlive the call the
+// array is handed to.
+struct OsslParam
+    key: *u8
+    data_type: u32
+    data: *u8
+    data_size: usize
+    return_size: usize
+end OsslParam
+
+// **A `bsize` of zero on the string one means "measure it"**, so the text has to be NUL-terminated.
+extern "OSSL_PARAM_construct_utf8_string" param_utf8_string(key: *u8, buf: *u8, bsize: usize) -> OsslParam
+extern "OSSL_PARAM_construct_octet_string" param_octet_string(key: *u8, buf: *u8, bsize: usize) -> OsslParam
+extern "OSSL_PARAM_construct_int" param_int(key: *u8, buf: *i32) -> OsslParam
+extern "OSSL_PARAM_construct_end" param_end() -> OsslParam
+
+// ## HMAC
+//
+// The `EVP_MAC` tier, which is OpenSSL 3's own; `HMAC_Init_ex` and its relatives are deprecated.
+// **A context holds its own reference on the algorithm**, so the `EvpMac` is freed as soon as the
+// context exists.
+opaque struct EvpMac
+opaque struct EvpMacCtx
+
+extern "EVP_MAC_fetch" mac_fetch(libctx: *u8, algorithm: *u8, properties: *u8) -> *EvpMac
+extern "EVP_MAC_free" mac_free(mac: *EvpMac)
+extern "EVP_MAC_CTX_new" mac_ctx_new(mac: *EvpMac) -> *EvpMacCtx
+extern "EVP_MAC_CTX_free" mac_ctx_free(ctx: *EvpMacCtx)
+extern "EVP_MAC_init" mac_init(ctx: *EvpMacCtx, key: *u8, keylen: usize, params: *OsslParam) -> i32
+extern "EVP_MAC_update" mac_update(ctx: *EvpMacCtx, data: *u8, datalen: usize) -> i32
+extern "EVP_MAC_final" mac_final(ctx: *EvpMacCtx, out: *u8, outl: *usize, outsize: usize) -> i32
+
+// ## HKDF
+//
+// The `EVP_KDF` tier. Everything -- the digest, the mode, the secret, the salt and the info -- is a
+// parameter handed to the one `derive` call.
+opaque struct EvpKdf
+opaque struct EvpKdfCtx
+
+extern "EVP_KDF_fetch" kdf_fetch(libctx: *u8, algorithm: *u8, properties: *u8) -> *EvpKdf
+extern "EVP_KDF_free" kdf_free(kdf: *EvpKdf)
+extern "EVP_KDF_CTX_new" kdf_ctx_new(kdf: *EvpKdf) -> *EvpKdfCtx
+extern "EVP_KDF_CTX_free" kdf_ctx_free(ctx: *EvpKdfCtx)
+extern "EVP_KDF_derive" kdf_derive(ctx: *EvpKdfCtx, key: *u8, keylen: usize, params: *OsslParam) -> i32
+
+// ## Authenticated encryption
+//
+// **The `_ex2` initialisers, which take no engine.** The cipher descriptions are static, like the
+// digests'.
+opaque struct EvpCipher
+opaque struct EvpCipherCtx
+
+extern "EVP_aes_128_gcm" aes_128_gcm() -> *EvpCipher
+extern "EVP_aes_256_gcm" aes_256_gcm() -> *EvpCipher
+extern "EVP_chacha20_poly1305" chacha20_poly1305() -> *EvpCipher
+extern "EVP_CIPHER_CTX_new" cipher_ctx_new() -> *EvpCipherCtx
+extern "EVP_CIPHER_CTX_free" cipher_ctx_free(ctx: *EvpCipherCtx)
+
+// How the tag is read after sealing and set before opening.
+extern "EVP_CIPHER_CTX_ctrl" cipher_ctx_ctrl(ctx: *EvpCipherCtx, ty: i32, arg: i32, ptr: *u8) -> i32
+
+// **A null `out` on an update is associated data**: authenticated, and written nowhere.
+extern "EVP_EncryptInit_ex2" encrypt_init(ctx: *EvpCipherCtx, cipher: *EvpCipher, key: *u8, iv: *u8, params: *OsslParam) -> i32
+extern "EVP_EncryptUpdate" encrypt_update(ctx: *EvpCipherCtx, out: *u8, outl: *i32, input: *u8, inl: i32) -> i32
+extern "EVP_EncryptFinal_ex" encrypt_final(ctx: *EvpCipherCtx, out: *u8, outl: *i32) -> i32
+extern "EVP_DecryptInit_ex2" decrypt_init(ctx: *EvpCipherCtx, cipher: *EvpCipher, key: *u8, iv: *u8, params: *OsslParam) -> i32
+extern "EVP_DecryptUpdate" decrypt_update(ctx: *EvpCipherCtx, out: *u8, outl: *i32, input: *u8, inl: i32) -> i32
+
+// **Where the tag is checked.** Anything but a positive answer is a message that did not
+// authenticate, and what the updates wrote before it is not to be believed.
+extern "EVP_DecryptFinal_ex" decrypt_final(ctx: *EvpCipherCtx, out: *u8, outl: *i32) -> i32
+
+// ## Memory
+//
+// A wipe the optimiser may not remove, and a comparison whose time does not depend on where two
+// buffers first differ.
+extern "OPENSSL_cleanse" cleanse(ptr: *u8, len: usize)
+extern "CRYPTO_memcmp" crypto_memcmp(a: *u8, b: *u8, len: usize) -> i32
+
 // ## The numbers
 //
 // **Read from the machine's headers rather than written here**, so a build against a different
@@ -332,3 +483,18 @@ c const
     // **A salt the length of the digest, which is what JOSE's PS256 specifies** -- and a negative
     // number, so a binding carrying it as an unsigned width would mean something else entirely.
     RSA_PSS_SALTLEN_DIGEST: i32 = "RSA_PSS_SALTLEN_DIGEST"
+
+    EVP_PKEY_ED25519: i32 = "EVP_PKEY_ED25519"
+
+    // The two halves of HKDF, and both together.
+    EVP_KDF_HKDF_MODE_EXTRACT_AND_EXPAND: i32 = "EVP_KDF_HKDF_MODE_EXTRACT_AND_EXPAND"
+    EVP_KDF_HKDF_MODE_EXTRACT_ONLY: i32 = "EVP_KDF_HKDF_MODE_EXTRACT_ONLY"
+    EVP_KDF_HKDF_MODE_EXPAND_ONLY: i32 = "EVP_KDF_HKDF_MODE_EXPAND_ONLY"
+
+    EVP_CTRL_AEAD_GET_TAG: i32 = "EVP_CTRL_AEAD_GET_TAG"
+    EVP_CTRL_AEAD_SET_TAG: i32 = "EVP_CTRL_AEAD_SET_TAG"
+
+    // What `OsslParam` has to be the size of.
+    OSSL_PARAM_SIZE: usize = "sizeof(OSSL_PARAM)"
+    OSSL_PARAM_DATA_OFFSET: usize = "offsetof(OSSL_PARAM, data)"
+    OSSL_PARAM_RETURN_SIZE_OFFSET: usize = "offsetof(OSSL_PARAM, return_size)"

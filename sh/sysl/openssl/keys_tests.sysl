@@ -1,0 +1,313 @@
+// Keys in every encoding, checked against encodings written out by hand.
+//
+// **The fixtures are the standards' own keys, wrapped by hand in the few bytes of DER each encoding
+// puts around them** -- RFC 8032's first Ed25519 key, RFC 6979's P-256 and P-384 keys. A
+// SubjectPublicKeyInfo for a named curve is a fixed prefix and then the point; a PKCS#8 Ed25519 key
+// is a fixed prefix and then the seed. So what a reader makes of the bytes, and what a writer
+// produces, are each compared with something this package did not write.
+//
+// **RFC 6979 prints the private scalar and both public coordinates**, which makes "the public half
+// of this private key" a known answer too: OpenSSL has to multiply the scalar out and land on the
+// RFC's point.
+
+module sh.sysl.openssl
+@tests
+
+import sysl.harness.*
+import sysl.buf.{Buf, buf}
+
+// What a kind is, as text a test can compare.
+private[openssl] kind_name(kind: KeyKind) -> string = kind match
+    Rsa(bits) -> s"rsa-${bits}"
+    RsaPss(bits) -> s"rsa-pss-${bits}"
+    EcP256 -> "p-256"
+    EcP384 -> "p-384"
+    EcP521 -> "p-521"
+    Ed25519 -> "ed25519"
+    Other -> "other"
+
+private[openssl] joined(a: string, b: string) -> Buf[u8]
+    var out = unhex(a)
+
+    out.extend(unhex(b).view())
+
+    out
+end joined
+
+// -- RFC 8032 section 7.1, test 1 ---------------------------------------------------------------------
+
+private[openssl] ed_seed() -> string = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+private[openssl] ed_public() -> string = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+
+// RFC 8410: the algorithm identifier is the bare OID 1.3.101.112, then the key.
+private ed_spki() -> Buf[u8] = joined("302a300506032b6570032100", ed_public())
+private ed_pkcs8() -> Buf[u8] = joined("302e020100300506032b657004220420", ed_seed())
+
+// -- RFC 6979 appendix A.2.5 and A.2.6 ----------------------------------------------------------------
+
+private[openssl] p256_d() -> string = "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721"
+
+private[openssl] p256_point() -> string = raw"""
+    60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6
+    7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299
+    """
+
+private[openssl] p384_d() -> string =
+    "6b9d3dad2e1b8c1c05b19875b6659f4de23c3b667bf297ba9aa47740787137d896d5724e4c70a825f872c9ea60d2edf5"
+
+private[openssl] p384_point() -> string = raw"""
+    ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc13
+    8015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720
+    """
+
+// id-ecPublicKey and the curve's OID, then the point, uncompressed.
+private[openssl] p256_spki() -> Buf[u8] = joined("3059301306072a8648ce3d020106082a8648ce3d03010703420004", p256_point())
+private[openssl] p384_spki() -> Buf[u8] = joined("3076301006072a8648ce3d020106052b8104002203620004", p384_point())
+
+// PKCS#8 around an `ECPrivateKey` holding the scalar and nothing optional.
+private[openssl] p256_pkcs8() -> Buf[u8] =
+    joined("3041020100301306072a8648ce3d020106082a8648ce3d030107042730250201010420", p256_d())
+
+private[openssl] p384_pkcs8() -> Buf[u8] =
+    joined("304e020100301006072a8648ce3d020106052b81040022043730350201010430", p384_d())
+
+// The traditional form, RFC 5915's `ECPrivateKey` on its own: the scalar, then the curve.
+private p256_sec1() -> Buf[u8]
+    var out = joined("30310201010420", p256_d())
+
+    out.extend(unhex("a00a06082a8648ce3d030107").view())
+
+    out
+end p256_sec1
+
+// -- Ed25519, every way round -------------------------------------------------------------------------
+
+@test
+an_ed25519_seed_is_rfc_8032s_key()
+    val key = ed25519_private_key(unhex(ed_seed()).view()).unwrap()
+
+    assert_eq(kind_name(key.kind()), "ed25519")
+    assert(key.raw().unwrap() == unhex(ed_seed()), "the seed did not come back")
+    assert(key.der().unwrap() == ed_pkcs8(), "the PKCS#8 is not RFC 8410's wrapping of the seed")
+
+    // **The known answer**: the public key is derived, and it is the one the RFC prints.
+    val public = key.public_key().unwrap()
+
+    assert_eq(kind_name(public.kind()), "ed25519")
+    assert(public.raw().unwrap() == unhex(ed_public()), "the public key is not RFC 8032's")
+    assert(public.der().unwrap() == ed_spki(), "the SubjectPublicKeyInfo is not RFC 8410's wrapping of the key")
+
+@test
+an_ed25519_key_reads_from_each_encoding()
+    val from_der = private_key_der(ed_pkcs8().view()).unwrap()
+
+    assert(from_der.raw().unwrap() == unhex(ed_seed()), "PKCS#8 read to another seed")
+
+    val public_from_der = public_key_der(ed_spki().view()).unwrap()
+
+    assert(public_from_der.raw().unwrap() == unhex(ed_public()), "SubjectPublicKeyInfo read to another key")
+
+    val public_from_raw = ed25519_public_key(unhex(ed_public()).view()).unwrap()
+
+    assert(public_from_raw.der().unwrap() == ed_spki(), "32 raw bytes wrote another SubjectPublicKeyInfo")
+
+    // And through PEM, both halves.
+    val pem = from_der.pem().unwrap()
+
+    assert(private_key(pem.view()).unwrap().raw().unwrap() == unhex(ed_seed()), "PEM read to another seed")
+
+    val public_pem = public_from_der.pem().unwrap()
+
+    assert(public_key(public_pem.view()).unwrap().raw().unwrap() == unhex(ed_public()), "PEM read to another key")
+
+@test
+pem_is_the_two_blocks_everything_reads()
+    val key = ed25519_private_key(unhex(ed_seed()).view()).unwrap()
+
+    // 48 bytes of PKCS#8 is one line of base64, so the whole block can be written out here.
+    val want = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g\n-----END PRIVATE KEY-----\n"
+
+    assert(key.pem().unwrap().view() == want.bytes, "the private PEM is not the block RFC 8410's bytes make")
+
+    val public_want = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\n-----END PUBLIC KEY-----\n"
+
+    assert(key.public_key().unwrap().pem().unwrap().view() == public_want.bytes, "the public PEM is not the block RFC 8410's bytes make")
+
+@test
+an_ed25519_key_of_the_wrong_length_is_refused()
+    val seed = unhex(ed_seed())
+
+    assert(ed25519_private_key(seed.view()[0..<31]).is_err(), "a 31-byte seed was taken")
+    assert(ed25519_private_key("".bytes).is_err(), "an empty seed was taken")
+    assert(ed25519_public_key(seed.view()[0..<31]).is_err(), "a 31-byte public key was taken")
+    assert(ed25519_public_key("".bytes).is_err(), "an empty public key was taken")
+
+    var long: Buf[u8] = buf()
+
+    long.extend(seed.view())
+    long.push(0)
+
+    assert(ed25519_private_key(long.view()).is_err(), "a 33-byte seed was taken")
+    assert(ed25519_public_key(long.view()).is_err(), "a 33-byte public key was taken")
+
+@test
+different_seeds_are_different_keys()
+    // **The fixture can fail**: one bit of the seed and the public key is another.
+    val near = flipped(unhex(ed_seed()).view(), 0)
+    val key = ed25519_private_key(near.view()).unwrap()
+
+    assert(key.public_key().unwrap().raw().unwrap() != unhex(ed_public()), "a different seed has RFC 8032's public key")
+    assert(key.der().unwrap() != ed_pkcs8(), "a different seed has the same PKCS#8")
+
+// -- elliptic-curve keys ------------------------------------------------------------------------------
+
+@test
+a_p256_private_key_has_rfc_6979s_public_key()
+    val key = private_key_der(p256_pkcs8().view()).unwrap()
+
+    assert_eq(kind_name(key.kind()), "p-256")
+    assert(key.public_key().unwrap().der().unwrap() == p256_spki(), "the public key is not the point RFC 6979 prints")
+
+@test
+a_p384_private_key_has_rfc_6979s_public_key()
+    val key = private_key_der(p384_pkcs8().view()).unwrap()
+
+    assert_eq(kind_name(key.kind()), "p-384")
+    assert(key.public_key().unwrap().der().unwrap() == p384_spki(), "the public key is not the point RFC 6979 prints")
+
+@test
+a_different_scalar_is_a_different_point()
+    val near = flipped(p256_pkcs8().view(), 66)
+    val key = private_key_der(near.view()).unwrap()
+
+    assert(key.public_key().unwrap().der().unwrap() != p256_spki(), "a different scalar has RFC 6979's public key")
+
+@test
+the_traditional_ec_form_is_read_and_pkcs8_is_written()
+    val key = private_key_der(p256_sec1().view()).unwrap()
+
+    assert_eq(kind_name(key.kind()), "p-256")
+    assert(key.public_key().unwrap().der().unwrap() == p256_spki(), "the traditional form read to another key")
+
+    // What is written is PKCS#8 whatever was read: version 0, then id-ecPublicKey.
+    // Whether the outer length takes one byte or two depends on whether the public point is
+    // carried inside, which is OpenSSL's choice; the test reads the header rather than assuming.
+    val der = key.der().unwrap()
+    val at: usize = if der[1] == 0x81 then 3 else 2
+
+    assert_eq(der[0], 0x30)
+    assert(der.view()[at..<(at + 3)] == unhex("020100").view(), "what was written does not open as PKCS#8")
+    assert(der.view()[(at + 3)..<(at + 14)] == unhex("301306072a8648ce3d0201").view(), "what was written does not name id-ecPublicKey")
+    assert(private_key_der(der.view()).unwrap().public_key().unwrap().der().unwrap() == p256_spki(),
+        "the PKCS#8 written read back to another key")
+
+@test
+public_keys_read_and_write_the_same_der()
+    val k256 = public_key_der(p256_spki().view()).unwrap()
+    val k384 = public_key_der(p384_spki().view()).unwrap()
+
+    assert_eq(kind_name(k256.kind()), "p-256")
+    assert_eq(kind_name(k384.kind()), "p-384")
+    assert(k256.der().unwrap() == p256_spki(), "a P-256 key was written differently from how it was read")
+    assert(k384.der().unwrap() == p384_spki(), "a P-384 key was written differently from how it was read")
+
+    // Through PEM and back.
+    val pem = k384.pem().unwrap()
+
+    assert(public_key(pem.view()).unwrap().der().unwrap() == p384_spki(), "PEM read to another key")
+
+@test
+private_keys_round_trip_through_der_and_pem()
+    val key = private_key_der(p384_pkcs8().view()).unwrap()
+    val der = key.der().unwrap()
+    val pem = key.pem().unwrap()
+
+    assert(private_key_der(der.view()).unwrap().der().unwrap() == der, "DER did not read back to itself")
+    assert(private_key(pem.view()).unwrap().der().unwrap() == der, "PEM did not read back to the same key")
+    assert(private_key(pem.view()).unwrap().public_key().unwrap().der().unwrap() == p384_spki(), "PEM read to another key")
+
+// -- what is refused ----------------------------------------------------------------------------------
+
+@test
+bytes_after_a_der_key_are_refused()
+    var public: Buf[u8] = p256_spki()
+    var secret: Buf[u8] = p256_pkcs8()
+
+    public.push(0)
+    secret.push(0)
+
+    assert(public_key_der(public.view()).is_err(), "a public key with a byte after it was read")
+    assert(private_key_der(secret.view()).is_err(), "a private key with a byte after it was read")
+
+    // And the same bytes without the extra one are fine, so it is the extra one that was refused.
+    assert(public_key_der(public.view()[0..<(public.len() - 1)]).is_ok(), "the key itself was refused")
+    assert(private_key_der(secret.view()[0..<(secret.len() - 1)]).is_ok(), "the key itself was refused")
+
+@test
+der_that_is_not_a_key_is_refused()
+    val spki = p256_spki()
+    val pkcs8 = p256_pkcs8()
+
+    assert(public_key_der("".bytes).is_err(), "no bytes were read as a public key")
+    assert(private_key_der("".bytes).is_err(), "no bytes were read as a private key")
+    assert(public_key_der(spki.view()[0..<(spki.len() - 1)]).is_err(), "a truncated public key was read")
+    assert(private_key_der(pkcs8.view()[0..<(pkcs8.len() - 1)]).is_err(), "a truncated private key was read")
+    assert(public_key_der("-----BEGIN PUBLIC KEY-----".bytes).is_err(), "PEM was read as DER")
+
+    // **A public key is not a private one**, in DER as in PEM.
+    assert(public_key_der(pkcs8.view()).is_err(), "a private key was read as a public one")
+    assert(private_key_der(spki.view()).is_err(), "a public key was read as a private one")
+
+    // A point that is not on the curve.
+    assert(public_key_der(flipped(spki.view(), spki.len() - 1).view()).is_err(), "a point off the curve was read as a key")
+
+@test
+only_an_ed25519_key_has_a_raw_form()
+    assert(public_key_der(p256_spki().view()).unwrap().raw().is_err(), "a P-256 public key answered raw bytes")
+    assert(private_key_der(p256_pkcs8().view()).unwrap().raw().is_err(), "a P-256 private key answered raw bytes")
+
+@test
+a_failure_leaves_nothing_behind_for_the_next_call()
+    // A refused key leaves lines on OpenSSL's queue; the next call that succeeds must not trip on
+    // them, and the next that fails must report its own.
+    assert(public_key_der(unhex("3000").view()).is_err(), "an empty SEQUENCE was read as a key")
+    assert(public_key_der(p256_spki().view()).is_ok(), "a good key was refused after a bad one")
+    assert(digest(Sha256, "abc".bytes).is_ok(), "a digest failed after a refused key")
+
+// -- making -------------------------------------------------------------------------------------------
+
+@test
+a_generated_key_is_the_kind_asked_for()
+    assert_eq(kind_name(generate_key(KeyKind.Ed25519).unwrap().kind()), "ed25519")
+    assert_eq(kind_name(generate_key(KeyKind.EcP256).unwrap().kind()), "p-256")
+    assert_eq(kind_name(generate_key(KeyKind.EcP384).unwrap().kind()), "p-384")
+    assert_eq(kind_name(generate_key(KeyKind.EcP521).unwrap().kind()), "p-521")
+    assert_eq(kind_name(generate_key(KeyKind.Rsa(2048)).unwrap().kind()), "rsa-2048")
+
+@test
+a_generated_key_round_trips_and_its_public_half_is_public()
+    val key = generate_key(KeyKind.EcP256).unwrap()
+    val der = key.der().unwrap()
+    val public = key.public_key().unwrap()
+
+    assert(private_key_der(der.view()).unwrap().public_key().unwrap().der().unwrap() == public.der().unwrap(),
+        "a generated key read back with another public half")
+    assert(private_key_der(public.der().unwrap().view()).is_err(), "a public half was read as a private key")
+    assert_eq(kind_name(public.kind()), "p-256")
+
+@test
+two_generated_keys_differ()
+    val a = generate_key(KeyKind.Ed25519).unwrap()
+    val b = generate_key(KeyKind.Ed25519).unwrap()
+
+    assert(a.raw().unwrap() != b.raw().unwrap(), "two generated keys are the same key")
+
+@test
+kinds_that_are_not_made_are_refused()
+    assert(generate_key(KeyKind.Rsa(1024)).is_err(), "a 1024-bit RSA key was made")
+    assert(generate_key(KeyKind.Rsa(2047)).is_err(), "a 2047-bit RSA key was made")
+    assert(generate_key(KeyKind.Rsa(16385)).is_err(), "a 16385-bit RSA key was made")
+    assert(generate_key(KeyKind.Rsa(0)).is_err(), "a 0-bit RSA key was made")
+    assert(generate_key(KeyKind.Rsa(-2048)).is_err(), "an RSA key of a negative size was made")
+    assert(generate_key(KeyKind.RsaPss(2048)).is_err(), "an RSASSA-PSS key was made")
+    assert(generate_key(KeyKind.Other).is_err(), "a key of no kind was made")

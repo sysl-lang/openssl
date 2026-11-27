@@ -1,0 +1,341 @@
+// Authenticated encryption, against the vectors of the documents that define it.
+//
+// **AES-GCM is checked against the test cases of the GCM specification itself** (McGrew and Viega,
+// "The Galois/Counter Mode of Operation", Appendix B -- the cases NIST's SP 800-38D validation
+// carries): 1 to 4 for a 128-bit key and 13 to 16 for a 256-bit one, which between them are the
+// empty message, one block, four blocks, and a message that is not a whole number of blocks with
+// associated data. **ChaCha20-Poly1305 is checked against RFC 8439 section 2.8.2.**
+//
+// **Every vector is then shown able to fail**: one bit of the key, the nonce, the associated data,
+// the ciphertext or the tag, and the message does not open.
+
+module sh.sysl.openssl
+@tests
+
+import sysl.harness.*
+import sysl.buf.{Buf, buf, buf_filled}
+
+private struct Vector
+    cipher: Aead
+    key: Buf[u8]
+    nonce: Buf[u8]
+    aad: Buf[u8]
+    plaintext: Buf[u8]
+    ciphertext: Buf[u8]
+    tag: Buf[u8]
+end Vector
+
+private sealed_of(v: Vector) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    out.extend(v.ciphertext.view())
+    out.extend(v.tag.view())
+
+    out
+end sealed_of
+
+// Both directions: sealing the plaintext answers the document's ciphertext and tag, and opening
+// those answers the plaintext.
+private check(v: Vector)
+    val sealed = aead_seal(v.cipher, v.key.view(), v.nonce.view(), v.aad.view(), v.plaintext.view()).unwrap()
+
+    assert_eq(sealed.len(), v.plaintext.len() + AEAD_TAG_LEN)
+    assert(sealed.view()[0..<v.plaintext.len()] == v.ciphertext.view(), "the ciphertext is not the document's")
+    assert(sealed.view()[v.plaintext.len()..<sealed.len()] == v.tag.view(), "the tag is not the document's")
+
+    aead_open(v.cipher, v.key.view(), v.nonce.view(), v.aad.view(), sealed_of(v).view()).unwrap() match
+        Some(opened) -> assert(opened == v.plaintext, "the document's ciphertext opened to something else")
+        None -> assert(false, "the document's own ciphertext and tag did not authenticate")
+end check
+
+private opens(v: Vector, key: []const u8, nonce: []const u8, aad: []const u8, sealed: []const u8) -> bool =
+    aead_open(v.cipher, key, nonce, aad, sealed).unwrap().is_some()
+
+// One bit of each thing a tag covers, first byte and last, and the message must not open.
+private check_it_can_fail(v: Vector)
+    val sealed = sealed_of(v)
+    val key = v.key.view()
+    val nonce = v.nonce.view()
+    val aad = v.aad.view()
+
+    assert(opens(v, key, nonce, aad, sealed.view()), "the untouched message did not open")
+
+    assert(!opens(v, flipped(key, 0).view(), nonce, aad, sealed.view()), "a wrong key opened it")
+    assert(!opens(v, flipped(key, key.len - 1).view(), nonce, aad, sealed.view()), "a key wrong in its last byte opened it")
+    assert(!opens(v, key, flipped(nonce, 0).view(), aad, sealed.view()), "a wrong nonce opened it")
+    assert(!opens(v, key, flipped(nonce, 11).view(), aad, sealed.view()), "a nonce wrong in its last byte opened it")
+
+    if aad.len > 0
+        assert(!opens(v, key, nonce, flipped(aad, 0).view(), sealed.view()), "changed associated data went unseen")
+        assert(!opens(v, key, nonce, flipped(aad, aad.len - 1).view(), sealed.view()), "associated data changed in its last byte went unseen")
+        assert(!opens(v, key, nonce, aad[0..<(aad.len - 1)], sealed.view()), "shortened associated data went unseen")
+        assert(!opens(v, key, nonce, "".bytes, sealed.view()), "dropped associated data went unseen")
+    end if
+
+    // Associated data that was never there.
+    var more: Buf[u8] = buf()
+
+    more.extend(aad)
+    more.push(0)
+
+    assert(!opens(v, key, nonce, more.view(), sealed.view()), "added associated data went unseen")
+
+    // Every byte of the ciphertext and of the tag.
+    for i in 0..<sealed.len()
+        assert(!opens(v, key, nonce, aad, flipped(sealed.view(), i).view()), s"a change at byte ${i} of the sealed message went unseen")
+
+    // A tag cut short is not a shorter tag.
+    assert(!opens(v, key, nonce, aad, sealed.view()[0..<(sealed.len() - 1)]), "a truncated message opened")
+end check_it_can_fail
+
+// -- the GCM specification's test cases ---------------------------------------------------------------
+
+private gcm_key() -> string = "feffe9928665731c6d6a8f9467308308"
+private gcm_nonce() -> string = "cafebabefacedbaddecaf888"
+private gcm_aad() -> string = "feedfacedeadbeeffeedfacedeadbeefabaddad2"
+
+private gcm_plaintext() -> string = raw"""
+    d9313225f88406e5a55909c5aff5269a
+    86a7a9531534f7da2e4c303d8a318a72
+    1c3c0c95956809532fcf0e2449a6b525
+    b16aedf5aa0de657ba637b391aafd255
+    """
+
+// The same, 60 bytes of it: a message that ends partway through a block.
+private gcm_plaintext_60() -> Buf[u8]
+    var out = unhex(gcm_plaintext())
+
+    out.truncate(60)
+
+    out
+end gcm_plaintext_60
+
+private gcm_case_1() -> Vector = Vector(Aes128Gcm, buf_filled(16, u8(0)), buf_filled(12, u8(0)), buf(), buf(), buf(),
+    unhex("58e2fccefa7e3061367f1d57a4e7455a"))
+
+private gcm_case_2() -> Vector = Vector(Aes128Gcm, buf_filled(16, u8(0)), buf_filled(12, u8(0)), buf(), buf_filled(16, u8(0)),
+    unhex("0388dace60b6a392f328c2b971b2fe78"), unhex("ab6e47d42cec13bdf53a67b21257bddf"))
+
+private gcm_case_3() -> Vector = Vector(Aes128Gcm, unhex(gcm_key()), unhex(gcm_nonce()), buf(), unhex(gcm_plaintext()),
+    unhex(raw"""
+        42831ec2217774244b7221b784d0d49c
+        e3aa212f2c02a4e035c17e2329aca12e
+        21d514b25466931c7d8f6a5aac84aa05
+        1ba30b396a0aac973d58e091473f5985
+        """),
+    unhex("4d5c2af327cd64a62cf35abd2ba6fab4"))
+
+private gcm_case_4() -> Vector = Vector(Aes128Gcm, unhex(gcm_key()), unhex(gcm_nonce()), unhex(gcm_aad()), gcm_plaintext_60(),
+    unhex(raw"""
+        42831ec2217774244b7221b784d0d49c
+        e3aa212f2c02a4e035c17e2329aca12e
+        21d514b25466931c7d8f6a5aac84aa05
+        1ba30b396a0aac973d58e091
+        """),
+    unhex("5bc94fbc3221a5db94fae95ae7121a47"))
+
+private gcm_key_256() -> Buf[u8] = unhex("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308")
+
+private gcm_case_13() -> Vector = Vector(Aes256Gcm, buf_filled(32, u8(0)), buf_filled(12, u8(0)), buf(), buf(), buf(),
+    unhex("530f8afbc74536b9a963b4f1c4cb738b"))
+
+private gcm_case_14() -> Vector = Vector(Aes256Gcm, buf_filled(32, u8(0)), buf_filled(12, u8(0)), buf(), buf_filled(16, u8(0)),
+    unhex("cea7403d4d606b6e074ec5d3baf39d18"), unhex("d0d1c8a799996bf0265b98b5d48ab919"))
+
+private gcm_case_15() -> Vector = Vector(Aes256Gcm, gcm_key_256(), unhex(gcm_nonce()), buf(), unhex(gcm_plaintext()),
+    unhex(raw"""
+        522dc1f099567d07f47f37a32a84427d
+        643a8cdcbfe5c0c97598a2bd2555d1aa
+        8cb08e48590dbb3da7b08b1056828838
+        c5f61e6393ba7a0abcc9f662898015ad
+        """),
+    unhex("b094dac5d93471bdec1a502270e3cc6c"))
+
+private gcm_case_16() -> Vector = Vector(Aes256Gcm, gcm_key_256(), unhex(gcm_nonce()), unhex(gcm_aad()), gcm_plaintext_60(),
+    unhex(raw"""
+        522dc1f099567d07f47f37a32a84427d
+        643a8cdcbfe5c0c97598a2bd2555d1aa
+        8cb08e48590dbb3da7b08b1056828838
+        c5f61e6393ba7a0abcc9f662
+        """),
+    unhex("76fc6ece0f4e1768cddf8853bb2d551b"))
+
+@test
+aes_128_gcm_case_1_nothing_at_all()
+    check(gcm_case_1())
+
+@test
+aes_128_gcm_case_2_one_block()
+    check(gcm_case_2())
+
+@test
+aes_128_gcm_case_3_four_blocks()
+    check(gcm_case_3())
+
+@test
+aes_128_gcm_case_4_a_partial_block_and_associated_data()
+    check(gcm_case_4())
+
+@test
+aes_256_gcm_case_13_nothing_at_all()
+    check(gcm_case_13())
+
+@test
+aes_256_gcm_case_14_one_block()
+    check(gcm_case_14())
+
+@test
+aes_256_gcm_case_15_four_blocks()
+    check(gcm_case_15())
+
+@test
+aes_256_gcm_case_16_a_partial_block_and_associated_data()
+    check(gcm_case_16())
+
+// -- RFC 8439 -----------------------------------------------------------------------------------------
+
+private sunscreen() -> string =
+    "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+
+private text(s: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    out.extend(s.bytes)
+
+    out
+end text
+
+private rfc_8439() -> Vector = Vector(ChaCha20Poly1305,
+    unhex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"),
+    unhex("070000004041424344454647"),
+    unhex("50515253c0c1c2c3c4c5c6c7"),
+    text(sunscreen()),
+    unhex(raw"""
+        d31a8d34648e60db7b86afbc53ef7ec2
+        a4aded51296e08fea9e2b5a736ee62d6
+        3dbea45e8ca9671282fafb69da92728b
+        1a71de0a9e060b2905d6a5b67ecd3b36
+        92ddbd7f2d778b8c9803aee328091b58
+        fab324e4fad675945585808b4831d7bc
+        3ff4def08e4b7a9de576d26586cec64b
+        6116
+        """),
+    unhex("1ae10b594f09e26a7e902ecbd0600691"))
+
+@test
+chacha20_poly1305_is_rfc_8439s_example()
+    check(rfc_8439())
+
+// -- every vector can fail ----------------------------------------------------------------------------
+
+@test
+an_aes_128_gcm_message_with_anything_changed_does_not_open()
+    check_it_can_fail(gcm_case_4())
+    check_it_can_fail(gcm_case_2())
+
+@test
+an_aes_256_gcm_message_with_anything_changed_does_not_open()
+    check_it_can_fail(gcm_case_16())
+    check_it_can_fail(gcm_case_14())
+
+@test
+a_chacha20_poly1305_message_with_anything_changed_does_not_open()
+    check_it_can_fail(rfc_8439())
+
+@test
+a_message_of_nothing_is_still_authenticated()
+    // No plaintext and no associated data leaves a bare tag, and it is still a tag over the key
+    // and the nonce.
+    check_it_can_fail(gcm_case_1())
+    check_it_can_fail(gcm_case_13())
+
+@test
+a_message_sealed_by_one_cipher_does_not_open_under_another()
+    val v = gcm_case_16()
+    val sealed = sealed_of(v)
+
+    assert(aead_open(ChaCha20Poly1305, v.key.view(), v.nonce.view(), v.aad.view(), sealed.view()).unwrap().is_none(),
+        "an AES-256-GCM message opened as ChaCha20-Poly1305")
+
+    val w = rfc_8439()
+
+    assert(aead_open(Aes256Gcm, w.key.view(), w.nonce.view(), w.aad.view(), sealed_of(w).view()).unwrap().is_none(),
+        "a ChaCha20-Poly1305 message opened as AES-256-GCM")
+
+@test
+bytes_shorter_than_a_tag_do_not_open()
+    val v = gcm_case_2()
+
+    for n in 0..<AEAD_TAG_LEN
+        assert(aead_open(v.cipher, v.key.view(), v.nonce.view(), "".bytes, v.tag.view()[0..<n]).unwrap().is_none(),
+            s"${n} bytes opened as a message")
+    end for
+
+// -- what is refused before anything is encrypted -----------------------------------------------------
+
+@test
+a_key_or_a_nonce_of_the_wrong_length_is_an_error()
+    val v = gcm_case_4()
+    val sealed = sealed_of(v)
+    val long = gcm_key_256()
+
+    // **`Err`, not `None`**: these are the caller's own mistakes, not a forgery.
+    assert(aead_seal(Aes128Gcm, long.view(), v.nonce.view(), "".bytes, "x".bytes).is_err(), "AES-128-GCM took a 32-byte key")
+    assert(aead_seal(Aes256Gcm, v.key.view(), v.nonce.view(), "".bytes, "x".bytes).is_err(), "AES-256-GCM took a 16-byte key")
+    assert(aead_seal(ChaCha20Poly1305, v.key.view(), v.nonce.view(), "".bytes, "x".bytes).is_err(), "ChaCha20-Poly1305 took a 16-byte key")
+    assert(aead_seal(Aes128Gcm, "".bytes, v.nonce.view(), "".bytes, "x".bytes).is_err(), "an empty key was taken")
+    assert(aead_seal(Aes128Gcm, v.key.view(), v.nonce.view()[0..<11], "".bytes, "x".bytes).is_err(), "an 11-byte nonce was taken")
+    assert(aead_seal(Aes128Gcm, v.key.view(), long.view()[0..<13], "".bytes, "x".bytes).is_err(), "a 13-byte nonce was taken")
+    assert(aead_seal(Aes128Gcm, v.key.view(), "".bytes, "".bytes, "x".bytes).is_err(), "an empty nonce was taken")
+
+    assert(aead_open(Aes128Gcm, long.view(), v.nonce.view(), v.aad.view(), sealed.view()).is_err(), "opening took a 32-byte key")
+    assert(aead_open(Aes128Gcm, v.key.view(), v.nonce.view()[0..<11], v.aad.view(), sealed.view()).is_err(), "opening took an 11-byte nonce")
+
+    assert_eq(aead_key_len(Aes128Gcm), 16)
+    assert_eq(aead_key_len(Aes256Gcm), 32)
+    assert_eq(aead_key_len(ChaCha20Poly1305), 32)
+
+// -- sizes the vectors do not have --------------------------------------------------------------------
+
+@test
+messages_of_every_small_length_seal_and_open()
+    // Through one block and into the third, for each cipher: the lengths where a block cipher's
+    // counter turns over and a stream cipher's does not.
+    val all = [Aes128Gcm, Aes256Gcm, ChaCha20Poly1305]
+    val key = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+    val nonce = unhex("0f0e0d0c0b0a090807060504")
+    val message = unhex(gcm_plaintext())
+
+    for cipher in all
+        val k = key.view()[0..<aead_key_len(cipher)]
+
+        for n in 0..<40
+            val sealed = aead_seal(cipher, k, nonce.view(), gcm_aad().bytes, message.view()[0..<n]).unwrap()
+
+            assert_eq(sealed.len(), n + AEAD_TAG_LEN)
+
+            // The ciphertext is not the plaintext, wherever there is any.
+            if n >= 8 then assert(sealed.view()[0..<n] != message.view()[0..<n], "the message was sealed as itself")
+
+            val opened = aead_open(cipher, k, nonce.view(), gcm_aad().bytes, sealed.view()).unwrap()
+
+            assert(opened.is_some(), s"a ${n}-byte message did not open")
+            assert(opened.unwrap().view() == message.view()[0..<n], s"a ${n}-byte message opened to something else")
+        end for
+    end for
+
+@test
+one_megabyte_seals_and_opens()
+    val key = buf_filled(32, u8(0x42))
+    val nonce = buf_filled(12, u8(0x24))
+    var message = buf_filled(1 << 20, u8(0))
+
+    for i in 0..<message.len()
+        message[i] = u8((i * 31 + i / 251) % 256)
+
+    val sealed = aead_seal(ChaCha20Poly1305, key.view(), nonce.view(), "".bytes, message.view()).unwrap()
+    val opened = aead_open(ChaCha20Poly1305, key.view(), nonce.view(), "".bytes, sealed.view()).unwrap().unwrap()
+
+    assert(opened == message, "a megabyte did not come back")
+    assert(aead_open(ChaCha20Poly1305, key.view(), nonce.view(), "".bytes, flipped(sealed.view(), 1 << 19).view()).unwrap().is_none(),
+        "a megabyte with one bit changed in the middle opened")

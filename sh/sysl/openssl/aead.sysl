@@ -1,0 +1,174 @@
+// Authenticated encryption: AES-GCM with 128- and 256-bit keys (NIST SP 800-38D) and
+// ChaCha20-Poly1305 (RFC 8439), each with a 12-byte nonce and a 16-byte tag.
+//
+// **A message that does not authenticate yields nothing.** Decryption writes into a buffer the
+// caller never sees until the tag has checked; when it does not, the buffer is wiped and `None` is
+// the whole answer. There is no call here that hands out unauthenticated plaintext.
+//
+// **A nonce is used once per key, and that is the caller's to guarantee.** Sealing two messages
+// under one key and one nonce gives away the XOR of the two plaintexts and, for GCM, the key that
+// authenticates them. A counter is a fine nonce; a random 12 bytes is one for at most a few billion
+// messages per key.
+
+module sh.sysl.openssl
+
+import sh.sysl.openssl.c
+import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.buf.{Buf, buf_filled}
+
+// An authenticated cipher.
+enum Aead
+    Aes128Gcm
+    Aes256Gcm
+    ChaCha20Poly1305
+end Aead
+
+// The nonce every cipher here takes, and the tag every one of them appends, in bytes.
+const AEAD_NONCE_LEN: usize = 12
+const AEAD_TAG_LEN: usize = 16
+
+// The key the cipher takes, in bytes: 16 for AES-128-GCM and 32 for the other two.
+aead_key_len(cipher: Aead) -> usize = cipher match
+    Aes128Gcm -> 16
+    Aes256Gcm -> 32
+    ChaCha20Poly1305 -> 32
+
+private cipher_of(cipher: Aead) -> *c.EvpCipher = cipher match
+    Aes128Gcm -> c.aes_128_gcm()
+    Aes256Gcm -> c.aes_256_gcm()
+    ChaCha20Poly1305 -> c.chacha20_poly1305()
+
+// **OpenSSL takes these lengths as an `int`**, so a piece past two gigabytes is refused here rather
+// than wrapped there.
+private const MOST: usize = 0x7fffffff
+
+private checked(cipher: Aead, key: []const u8, nonce: []const u8, aad: []const u8, body: usize) -> Result[unit, Error]
+    if key.len != aead_key_len(cipher)
+        return Err(refused(s"this cipher's key is ${aead_key_len(cipher)} bytes, and this one is ${key.len}"))
+
+    if nonce.len != AEAD_NONCE_LEN then return Err(refused(s"the nonce is 12 bytes, and this one is ${nonce.len}"))
+
+    if aad.len > MOST || body > MOST then return Err(refused("a message past 2 GiB is not sealed or opened in one piece"))
+
+    Ok(())
+end checked
+
+// `plaintext` encrypted under `key` and `nonce`, authenticating it and `aad`: the ciphertext, as
+// long as the plaintext, then the 16-byte tag.
+//
+// `aad` is authenticated and not encrypted or carried: the one who opens has to supply the same
+// bytes. Either it or the plaintext may be empty.
+aead_seal(cipher: Aead, key: []const u8, nonce: []const u8, aad: []const u8, plaintext: []const u8) -> Result[Buf[u8], Error]
+    checked(cipher, key, nonce, aad, plaintext.len)?
+
+    c.err_clear_error()
+
+    val ctx = c.cipher_ctx_new()
+
+    if ctx == null then return Err(fail(c.SSL_ERROR_SSL, "encryption could not begin"))
+
+    var out = buf_filled(plaintext.len + AEAD_TAG_LEN, u8(0))
+    var n: i32 = 0
+    var ok = c.encrypt_init(ctx, cipher_of(cipher), as_ptr(key), as_ptr(nonce), null)
+
+    if ok == 1 && aad.len > 0 then ok = c.encrypt_update(ctx, null, &n, as_ptr(aad), i32(aad.len))
+
+    if ok == 1 && plaintext.len > 0
+        ok = c.encrypt_update(ctx, as_mut_ptr(out.view_mut()), &n, as_ptr(plaintext), i32(plaintext.len))
+
+        if ok == 1 && usize(n) != plaintext.len then ok = 0
+    end if
+
+    // A stream mode writes nothing at the end; the call is what computes the tag.
+    var tail: [16]u8
+
+    if ok == 1 then ok = c.encrypt_final(ctx, &tail[0], &n)
+
+    if ok == 1 && n != 0 then ok = 0
+
+    var tag: [16]u8
+
+    if ok == 1 then ok = c.cipher_ctx_ctrl(ctx, c.EVP_CTRL_AEAD_GET_TAG, i32(AEAD_TAG_LEN), &tag[0])
+
+    // The context holds the expanded key, and freeing it wipes that.
+    c.cipher_ctx_free(ctx)
+
+    if ok != 1
+        wipe(out.view_mut())
+
+        return Err(fail(c.SSL_ERROR_SSL, "the message could not be sealed"))
+    end if
+
+    for i in 0..<AEAD_TAG_LEN
+        out[plaintext.len + i] = tag[i]
+
+    Ok(out)
+end aead_seal
+
+// What `sealed` -- a ciphertext and its 16-byte tag, as `aead_seal` answers them -- decrypts to
+// under `key` and `nonce`, if it and `aad` authenticate.
+//
+// **`Ok(None)` is a message that does not authenticate, and `Err` is a question that could not be
+// asked.** `None` is the answer when anything about the ciphertext, the tag or `aad` was changed,
+// when they were sealed under another key or nonce, and when `sealed` is shorter than a tag: all of
+// those are bytes somebody else sent. `Err` is a key or a nonce of the wrong length, or OpenSSL
+// failing, which are the caller's own.
+aead_open(cipher: Aead, key: []const u8, nonce: []const u8, aad: []const u8, sealed: []const u8) -> Result[Option[Buf[u8]], Error]
+    checked(cipher, key, nonce, aad, sealed.len)?
+
+    if sealed.len < AEAD_TAG_LEN then return Ok(None)
+
+    val body = sealed.len - AEAD_TAG_LEN
+
+    c.err_clear_error()
+
+    val ctx = c.cipher_ctx_new()
+
+    if ctx == null then return Err(fail(c.SSL_ERROR_SSL, "decryption could not begin"))
+
+    var out = buf_filled(body, u8(0))
+    var n: i32 = 0
+    var ok = c.decrypt_init(ctx, cipher_of(cipher), as_ptr(key), as_ptr(nonce), null)
+
+    if ok == 1 && aad.len > 0 then ok = c.decrypt_update(ctx, null, &n, as_ptr(aad), i32(aad.len))
+
+    if ok == 1 && body > 0
+        ok = c.decrypt_update(ctx, as_mut_ptr(out.view_mut()), &n, as_ptr(sealed), i32(body))
+
+        if ok == 1 && usize(n) != body then ok = 0
+    end if
+
+    // **The tag is copied because the call that sets it takes a pointer it may write through**, and
+    // `sealed` is the caller's and read-only.
+    var tag: [16]u8
+
+    for i in 0..<AEAD_TAG_LEN
+        tag[i] = sealed[body + i]
+
+    if ok == 1 then ok = c.cipher_ctx_ctrl(ctx, c.EVP_CTRL_AEAD_SET_TAG, i32(AEAD_TAG_LEN), &tag[0])
+
+    if ok != 1
+        val why = fail(c.SSL_ERROR_SSL, "the message could not be decrypted")
+
+        c.cipher_ctx_free(ctx)
+        wipe(out.view_mut())
+
+        return Err(why)
+    end if
+
+    // **This is the check.** Everything before it has decrypted bytes nobody has vouched for.
+    var tail: [16]u8
+    val authentic = c.decrypt_final(ctx, &tail[0], &n) > 0 && n == 0
+
+    c.cipher_ctx_free(ctx)
+
+    if !authentic
+        // A failed tag leaves an entry on OpenSSL's queue that describes no failure of the caller's.
+        c.err_clear_error()
+        wipe(out.view_mut())
+
+        return Ok(None)
+    end if
+
+    Ok(Some(out))
+end aead_open

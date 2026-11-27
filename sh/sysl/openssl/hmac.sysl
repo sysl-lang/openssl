@@ -1,0 +1,209 @@
+// HMAC (RFC 2104) and HKDF (RFC 5869), over any digest this package names.
+//
+// **Compare a MAC with `equal`, never with `==`.** A received MAC is checked by computing the right
+// one and comparing, and a comparison that stops at the first wrong byte tells whoever is sending
+// forgeries how many bytes they have right.
+//
+// **HKDF is for a secret that is already unguessable** -- a Diffie-Hellman result, a random master
+// key -- and turns it into as many independent keys as there are `info` strings. It is not for a
+// password: it is fast on purpose, which is the opposite of what stretching a password needs.
+
+module sh.sysl.openssl
+
+import sh.sysl.openssl.c
+import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.text.cstring
+import sysl.buf.{Buf, buf_filled}
+
+// -- HMAC ---------------------------------------------------------------------------------------------
+
+// An HMAC in progress.
+//
+// **Finished once**, as a `Hasher` is: `finish` answers the MAC of everything fed and the value is
+// then spent.
+struct Hmac
+    private ctx: *c.EvpMacCtx
+    private of: Digest
+    private spent: bool
+
+    // Feed more of the message. Any split of a message into pieces gives the same MAC.
+    update(&self, data: []const u8) -> Result[unit, Error]
+        if self.spent then return Err(refused("this HMAC has already been finished"))
+
+        if data.len == 0 then return Ok(())
+
+        c.err_clear_error()
+
+        if c.mac_update(self.ctx, as_ptr(data), data.len) != 1
+            return Err(fail(c.SSL_ERROR_SSL, "the HMAC would not take those bytes"))
+
+        Ok(())
+    end update
+
+    // The MAC of everything fed, as long as the digest.
+    finish(&self) -> Result[Buf[u8], Error]
+        if self.spent then return Err(refused("this HMAC has already been finished"))
+
+        self.spent = true
+
+        var out = buf_filled(digest_size(self.of), u8(0))
+        var wrote: usize = 0
+
+        c.err_clear_error()
+
+        if c.mac_final(self.ctx, as_mut_ptr(out.view_mut()), &wrote, out.len()) != 1 || wrote != out.len()
+            return Err(fail(c.SSL_ERROR_SSL, "the HMAC could not be finished"))
+
+        Ok(out)
+    end finish
+end Hmac
+
+// **The context is where the key lives**, and `EVP_MAC_CTX_free` wipes it on the way out.
+impl Drop for Hmac
+    drop(self) = c.mac_ctx_free(self.ctx)
+
+// Begin an HMAC under `key`, which may be any length, none included: RFC 2104 hashes a key longer
+// than the digest's block and pads a shorter one.
+hmac_begin(of: Digest, key: []const u8) -> Result[&Hmac, Error]
+    c.err_clear_error()
+
+    val algorithm = cstring("HMAC")
+    val mac = c.mac_fetch(null, algorithm.ptr, null)
+
+    if mac == null then return Err(fail(c.SSL_ERROR_SSL, "this OpenSSL has no HMAC"))
+
+    val ctx = c.mac_ctx_new(mac)
+
+    // The context took a reference of its own, so this one is finished with either way.
+    c.mac_free(mac)
+
+    if ctx == null then return Err(fail(c.SSL_ERROR_SSL, "could not begin an HMAC"))
+
+    val setting = cstring("digest")
+    val name = cstring(md_name(of))
+    var params: [2]c.OsslParam = [c.param_utf8_string(setting.ptr, name.ptr, 0), c.param_end()]
+
+    // **A key of no bytes is still a pointer**: a null one means "keep the key already set", and
+    // there is none.
+    var nothing: [1]u8
+    val from = if key.len == 0 then &nothing[0] else as_ptr(key)
+
+    if c.mac_init(ctx, from, key.len, &params[0]) != 1
+        val why = fail(c.SSL_ERROR_SSL, "could not begin an HMAC")
+
+        c.mac_ctx_free(ctx)
+
+        return Err(why)
+    end if
+
+    Ok(Hmac(ctx, of, false))
+end hmac_begin
+
+// The HMAC of `message` under `key`, as long as the digest.
+hmac(of: Digest, key: []const u8, message: []const u8) -> Result[Buf[u8], Error]
+    val h = hmac_begin(of, key)?
+
+    h.update(message)?
+    h.finish()
+end hmac
+
+// -- HKDF ---------------------------------------------------------------------------------------------
+
+private hkdf_derive(of: Digest, mode: i32, secret: []const u8, salt: []const u8, info: []const u8, length: usize) -> Result[Buf[u8], Error]
+    c.err_clear_error()
+
+    val algorithm = cstring("HKDF")
+    val kdf = c.kdf_fetch(null, algorithm.ptr, null)
+
+    if kdf == null then return Err(fail(c.SSL_ERROR_SSL, "this OpenSSL has no HKDF"))
+
+    val ctx = c.kdf_ctx_new(kdf)
+
+    c.kdf_free(kdf)
+
+    if ctx == null then return Err(fail(c.SSL_ERROR_SSL, "could not begin a key derivation"))
+
+    val k_digest = cstring("digest")
+    val k_mode = cstring("mode")
+    val k_key = cstring("key")
+    val k_salt = cstring("salt")
+    val k_info = cstring("info")
+    val name = cstring(md_name(of))
+
+    var how = mode
+    var nothing: [1]u8
+    val from = if secret.len == 0 then &nothing[0] else as_ptr(secret)
+
+    // **A salt or an info of no bytes is left out rather than passed empty**: RFC 5869 defines an
+    // absent salt as a digest's worth of zeros, which HMAC makes of an empty key anyway, and an
+    // absent info as the empty string.
+    var params: [6]c.OsslParam
+    var n: usize = 3
+
+    params[0] = c.param_utf8_string(k_digest.ptr, name.ptr, 0)
+    params[1] = c.param_int(k_mode.ptr, &how)
+    params[2] = c.param_octet_string(k_key.ptr, from, secret.len)
+
+    if salt.len > 0
+        params[n] = c.param_octet_string(k_salt.ptr, as_ptr(salt), salt.len)
+        n += 1
+
+    if info.len > 0
+        params[n] = c.param_octet_string(k_info.ptr, as_ptr(info), info.len)
+        n += 1
+
+    params[n] = c.param_end()
+
+    var out = buf_filled(length, u8(0))
+    val rc = c.kdf_derive(ctx, as_mut_ptr(out.view_mut()), length, &params[0])
+
+    // **The context holds a copy of the secret**, and freeing it wipes that copy.
+    c.kdf_ctx_free(ctx)
+
+    if rc != 1
+        wipe(out.view_mut())
+
+        return Err(fail(c.SSL_ERROR_SSL, "the key could not be derived"))
+    end if
+
+    Ok(out)
+end hkdf_derive
+
+private hkdf_length(of: Digest, length: usize) -> Result[unit, Error]
+    val most = 255 * digest_size(of)
+
+    if length == 0 || length > most
+        return Err(refused(s"HKDF over this digest makes 1 to ${most} bytes, and ${length} were asked for"))
+
+    Ok(())
+end hkdf_length
+
+// `length` bytes of key from `secret`, `salt` and `info`: RFC 5869's extract-then-expand, whole.
+//
+// `salt` may be empty, which RFC 5869 defines as a digest's worth of zeros; `info` may be empty.
+// Different `info` strings give keys that tell nothing about each other, which is how one secret
+// becomes several. `length` is at most 255 digests.
+hkdf(of: Digest, secret: []const u8, salt: []const u8, info: []const u8, length: usize) -> Result[Buf[u8], Error]
+    hkdf_length(of, length)?
+
+    hkdf_derive(of, c.EVP_KDF_HKDF_MODE_EXTRACT_AND_EXPAND, secret, salt, info, length)
+end hkdf
+
+// HKDF-Extract (RFC 5869 section 2.2): the pseudorandom key `salt` and `secret` condense to, as
+// long as the digest. It is `hmac(of, salt, secret)`, with an empty salt read as zeros.
+hkdf_extract(of: Digest, salt: []const u8, secret: []const u8) -> Result[Buf[u8], Error] =
+    hkdf_derive(of, c.EVP_KDF_HKDF_MODE_EXTRACT_ONLY, secret, salt, "".bytes, digest_size(of))
+
+// HKDF-Expand (RFC 5869 section 2.3): `length` bytes from a pseudorandom key and `info`.
+//
+// **`prk` is at least as long as the digest**, which is what the RFC requires of it and what makes
+// it a key rather than a guessable input: it is the answer of `hkdf_extract`, or a uniformly random
+// key of that strength. A shorter one is refused.
+hkdf_expand(of: Digest, prk: []const u8, info: []const u8, length: usize) -> Result[Buf[u8], Error]
+    hkdf_length(of, length)?
+
+    if prk.len < digest_size(of)
+        return Err(refused(s"an HKDF pseudorandom key over this digest is at least ${digest_size(of)} bytes, and this one is ${prk.len}"))
+
+    hkdf_derive(of, c.EVP_KDF_HKDF_MODE_EXPAND_ONLY, prk, "".bytes, info, length)
+end hkdf_expand
