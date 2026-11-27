@@ -7,7 +7,7 @@ signatures, digests, HMAC, HKDF and authenticated encryption.
 
 ```
 dependencies {
-  openssl { git = "github.com/sysl-lang/openssl", version = "0.3.0" }
+  openssl { git = "github.com/sysl-lang/openssl", version = "0.4.0" }
 }
 ```
 
